@@ -1236,7 +1236,8 @@ def gemini_classify(
                     f"{response.status_code}: "
                     f"{clean_text(response.text, 500)}"
                 )
-           data = response.json()
+
+            data = response.json()
 
             candidates = data.get("candidates") or []
 
