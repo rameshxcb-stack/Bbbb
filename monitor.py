@@ -29,6 +29,15 @@ USER_AGENT = os.getenv(
     "Mozilla/5.0 (compatible; JharkhandNoticeMonitor/3.0)"
 )
 
+STRONG_KEYWORDS = [
+    "recruitment", "vacancy", "post", "job", "result",
+    "admit card", "answer key", "merit", "selection",
+    "scholarship", "admission", "counselling",
+    "notification", "notice", "tender", "appointment",
+    "भर्ती", "परिणाम", "नियुक्ति", "प्रवेश", "छात्रवृत्ति",
+    "सूचना", "नोटिस", "निविदा"
+]
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -1105,6 +1114,38 @@ def scan_site(
     )
 
 
+def keyword_fallback(
+    items: List[Dict[str, Any]]
+) -> Dict[str, Dict[str, Any]]:
+    """Gemini fail होने पर keyword-based fallback"""
+
+    result = {}
+
+    for index, item in enumerate(items):
+
+        text = (
+            f"{item.get('title', '')} "
+            f"{item.get('url', '')} "
+            f"{item.get('context', '')}"
+        ).lower()
+
+        important = any(
+            kw in text
+            for kw in STRONG_KEYWORDS
+            if kw
+        )
+
+        result[str(index)] = {
+            "important": important,
+            "summary": clean_text(
+                item.get("title", ""),
+                180
+            ),
+        }
+
+    return result
+
+
 def gemini_classify(
     items: List[Dict[str, Any]],
     api_key: str,
@@ -1239,6 +1280,7 @@ def gemini_classify(
 
             data = response.json()
 
+            # ---- FIX 1: data dict या list ----
             candidates = []
 
             if isinstance(data, dict):
@@ -1256,6 +1298,7 @@ def gemini_classify(
 
             first = candidates[0]
 
+            # ---- FIX 2: content dict या list ----
             parts = []
 
             if isinstance(first, dict):
@@ -1283,16 +1326,38 @@ def gemini_classify(
                     "Gemini returned empty response"
                 )
 
-            parsed = json.loads(
-                text
+            # Markdown fence हटाओ अगर है
+            text = re.sub(
+                r"^```(?:json)?\s*",
+                "",
+                text,
+                flags=re.I
             )
+            text = re.sub(
+                r"\s*```$",
+                "",
+                text
+            ).strip()
+
+            parsed = json.loads(text)
+
+            # ---- FIX 3: parsed dict या list ----
+            rows = []
+
+            if isinstance(parsed, dict):
+                raw_rows = parsed.get("items")
+                if isinstance(raw_rows, list):
+                    rows = raw_rows
+
+            elif isinstance(parsed, list):
+                rows = parsed
 
             result = {}
 
-            for row in parsed.get(
-                "items",
-                []
-            ):
+            for row in rows:
+
+                if not isinstance(row, dict):
+                    continue
 
                 idx = str(
                     row.get(
@@ -1351,9 +1416,14 @@ def gemini_classify(
                     )
                 )
 
-    raise RuntimeError(
-        last_error
+    # ---- सब attempts fail — keyword fallback ----
+    print(
+        f"[WARN] Gemini failed after 3 attempts: "
+        f"{last_error}. Using keyword fallback.",
+        file=sys.stderr
     )
+
+    return keyword_fallback(items)
 
 
 def telegram_request(
@@ -1728,7 +1798,6 @@ def main() -> int:
         ""
     ).strip()
 
-    # Workflow does not define GEMINI_MODEL.
     model = (
         os.getenv(
             "GEMINI_MODEL",
@@ -1925,8 +1994,6 @@ def main() -> int:
             result["success"]
         )
 
-        # First successful scan of each site
-        # creates its baseline.
         if (
             not ss["baseline_complete"]
             and current_scan_success
@@ -2239,8 +2306,6 @@ def main() -> int:
                 file=sys.stderr
             )
 
-            # Remaining batches are kept pending
-            # for a future run.
             break
 
     ready = [
