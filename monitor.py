@@ -1239,28 +1239,38 @@ def gemini_classify(
 
             data = response.json()
 
-            candidates = data.get("candidates") or []
+            candidates = []
 
-            if not isinstance(candidates, list) or not candidates:
+            if isinstance(data, dict):
+                raw = data.get("candidates")
+                if isinstance(raw, list):
+                    candidates = raw
+
+            elif isinstance(data, list):
+                candidates = data
+
+            if not candidates:
                 raise RuntimeError(
                     "Gemini returned no candidates"
                 )
 
             first = candidates[0]
 
-            if not isinstance(first, dict):
-                raise RuntimeError(
-                    "Gemini candidate format unexpected"
-                )
+            parts = []
 
-            content = first.get("content")
+            if isinstance(first, dict):
+                content = first.get("content")
 
-            if isinstance(content, dict):
-                parts = content.get("parts", [])
-            elif isinstance(content, list):
-                parts = content
-            else:
-                parts = []
+                if isinstance(content, dict):
+                    raw_parts = content.get("parts")
+                    if isinstance(raw_parts, list):
+                        parts = raw_parts
+
+                elif isinstance(content, list):
+                    parts = content
+
+            elif isinstance(first, list):
+                parts = first
 
             text = "".join(
                 str(part.get("text", ""))
