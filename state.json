@@ -796,7 +796,7 @@
       "is_pdf": false,
       "first_seen": "2026-10-05T08:36:49.371150+00:00",
       "last_seen": "2026-10-05T08:36:49.371151+00:00",
-      "status": "baseline",
+      "status": "pending",
       "attempts": 0,
       "summary": "",
       "last_error": null
