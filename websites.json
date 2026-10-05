@@ -1,0 +1,204 @@
+{
+  "category": "jharkhand-district",
+  "scan": {
+    "request_timeout_seconds": 25,
+    "max_workers": 10,
+    "max_items_per_site": 50,
+    "max_discovery_pages_per_site": 5,
+    "max_new_items_per_run": 30,
+    "gemini_batch_size": 8,
+    "gemini_max_calls_per_run": 20,
+    "retention_days": 90,
+    "max_pending_attempts": 12,
+    "sitemap_enabled": true,
+    "keywords": [
+      "notice",
+      "notification",
+      "recruitment",
+      "vacancy",
+      "job",
+      "result",
+      "admit card",
+      "answer key",
+      "scholarship",
+      "admission",
+      "tender",
+      "important",
+      "appointment",
+      "selection",
+      "merit",
+      "counselling",
+      "provisional",
+      "भर्ती",
+      "नियुक्ति",
+      "परिणाम",
+      "प्रवेश",
+      "छात्रवृत्ति",
+      "सूचना",
+      "नोटिस",
+      "निविदा"
+    ],
+    "discovery_keywords": [
+      "notice",
+      "notification",
+      "notices",
+      "recruitment",
+      "vacancy",
+      "result",
+      "admit",
+      "tender",
+      "important",
+      "सूचना",
+      "नोटिस",
+      "भर्ती",
+      "परिणाम",
+      "निविदा"
+    ]
+  },
+  "websites": [
+    {
+      "id": "chatra",
+      "name": "Chatra District",
+      "url": "https://chatra.nic.in/",
+      "enabled": true
+    },
+    {
+      "id": "bokaro",
+      "name": "Bokaro District",
+      "url": "https://bokaro.nic.in/",
+      "enabled": true
+    },
+    {
+      "id": "deoghar",
+      "name": "Deoghar District",
+      "url": "https://deoghar.nic.in/",
+      "enabled": true
+    },
+    {
+      "id": "dhanbad",
+      "name": "Dhanbad District",
+      "url": "https://dhanbad.nic.in/",
+      "enabled": true
+    },
+    {
+      "id": "dumka",
+      "name": "Dumka District",
+      "url": "https://dumka.nic.in/",
+      "enabled": true
+    },
+    {
+      "id": "east-singhbhum",
+      "name": "East Singhbhum District",
+      "url": "https://jamshedpur.nic.in/",
+      "enabled": true
+    },
+    {
+      "id": "garhwa",
+      "name": "Garhwa District",
+      "url": "https://garhwa.nic.in/",
+      "enabled": true
+    },
+    {
+      "id": "giridih",
+      "name": "Giridih District",
+      "url": "https://giridih.nic.in/",
+      "enabled": true
+    },
+    {
+      "id": "godda",
+      "name": "Godda District",
+      "url": "https://godda.nic.in/",
+      "enabled": true
+    },
+    {
+      "id": "gumla",
+      "name": "Gumla District",
+      "url": "https://gumla.nic.in/",
+      "enabled": true
+    },
+    {
+      "id": "hazaribagh",
+      "name": "Hazaribagh District",
+      "url": "https://hazaribag.nic.in/",
+      "enabled": true
+    },
+    {
+      "id": "jamtara",
+      "name": "Jamtara District",
+      "url": "https://jamtara.nic.in/",
+      "enabled": true
+    },
+    {
+      "id": "khunti",
+      "name": "Khunti District",
+      "url": "https://khunti.nic.in/",
+      "enabled": true
+    },
+    {
+      "id": "koderma",
+      "name": "Koderma District",
+      "url": "https://koderma.nic.in/",
+      "enabled": true
+    },
+    {
+      "id": "latehar",
+      "name": "Latehar District",
+      "url": "https://latehar.nic.in/",
+      "enabled": true
+    },
+    {
+      "id": "lohardaga",
+      "name": "Lohardaga District",
+      "url": "https://lohardaga.nic.in/",
+      "enabled": true
+    },
+    {
+      "id": "pakur",
+      "name": "Pakur District",
+      "url": "https://pakur.nic.in/",
+      "enabled": true
+    },
+    {
+      "id": "palamu",
+      "name": "Palamu District",
+      "url": "https://palamu.nic.in/",
+      "enabled": true
+    },
+    {
+      "id": "ramgarh",
+      "name": "Ramgarh District",
+      "url": "https://ramgarh.nic.in/",
+      "enabled": true
+    },
+    {
+      "id": "ranchi",
+      "name": "Ranchi District",
+      "url": "https://ranchi.nic.in/",
+      "enabled": true
+    },
+    {
+      "id": "sahibganj",
+      "name": "Sahibganj District",
+      "url": "https://sahibganj.nic.in/",
+      "enabled": true
+    },
+    {
+      "id": "seraikela",
+      "name": "Saraikela Kharsawan District",
+      "url": "https://seraikela.nic.in/",
+      "enabled": true
+    },
+    {
+      "id": "simdega",
+      "name": "Simdega District",
+      "url": "https://simdega.nic.in/",
+      "enabled": true
+    },
+    {
+      "id": "west-singhbhum",
+      "name": "West Singhbhum District",
+      "url": "https://chaibasa.nic.in/",
+      "enabled": true
+    }
+  ]
+}
