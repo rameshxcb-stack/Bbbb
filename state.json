@@ -1,0 +1,14 @@
+{
+  "version": 4,
+  "initialized": false,
+  "last_run": null,
+  "items": {},
+  "sites": {},
+  "stats": {
+    "runs": 0,
+    "sent": 0,
+    "ignored": 0,
+    "pending": 0,
+    "errors": 0
+  }
+}
