@@ -22,7 +22,7 @@ CONFIG_FILE = BASE / "websites.json"
 STATE_FILE = BASE / "state.json"
 
 # Gemini model
-DEFAULT_MODEL = "gemini-2.5-flash-lite"
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
 
 USER_AGENT = os.getenv(
     "MONITOR_USER_AGENT",
