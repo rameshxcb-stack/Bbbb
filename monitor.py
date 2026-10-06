@@ -30,7 +30,9 @@ FALLBACK_MODELS = [
     "gemini-2.0-flash-lite",
 ]
 
-FUZZY_DUPLICATE_THRESHOLD = 95
+# FIX 4: 95 → 97 (avoid skipping "Recruitment 01/2026" vs "Recruitment 02/2026")
+FUZZY_DUPLICATE_THRESHOLD = 97
+
 MAX_PDF_BYTES = 5 * 1024 * 1024
 MAX_PDF_PAGES = 3
 MAX_PDF_TEXT_CHARS = 2500
@@ -45,7 +47,7 @@ STALE_NOTICE_DAYS = int(os.getenv("STALE_NOTICE_DAYS", "30"))
 
 USER_AGENT = os.getenv(
     "MONITOR_USER_AGENT",
-    "Mozilla/5.0 (compatible; JharkhandNoticeMonitor/5.5)"
+    "Mozilla/5.0 (compatible; JharkhandNoticeMonitor/5.6)"
 )
 
 STRONG_KEYWORDS = [
@@ -177,10 +179,13 @@ _MONTH_NAMES = {
     "नवंबर": 11, "नवम्बर": 11, "दिसंबर": 12, "दिसम्बर": 12,
 }
 
+# FIX 1: Hindi months added to regex
 _MONTH_REGEX = (
     r"jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|"
     r"january|february|march|april|june|july|august|"
-    r"september|october|november|december"
+    r"september|october|november|december|"
+    r"जनवरी|फरवरी|मार्च|अप्रैल|मई|जून|जुलाई|अगस्त|"
+    r"सितंबर|सितम्बर|अक्टूबर|अक्तूबर|नवंबर|नवम्बर|दिसंबर|दिसम्बर"
 )
 
 _FULL_DATE_PATTERNS = [
@@ -374,7 +379,7 @@ def get_config():
         "max_items_per_site": 100,
         "max_discovery_pages_per_site": 5,
         "max_new_items_per_run": 30,
-        "gemini_batch_size": 4,
+        "gemini_batch_size": 3,
         "gemini_max_calls_per_run": 25,
         "retention_days": 90,
         "max_pending_attempts": 12,
@@ -434,7 +439,7 @@ def get_config():
 
 def default_state():
     return {
-        "version": 13,
+        "version": 14,
         "initialized": False,
         "last_run": None,
         "items": {},
@@ -476,7 +481,7 @@ def load_state():
         record.setdefault("upload_date", None)
         record.setdefault("first_seen", utc_now())
         record.setdefault("last_seen", record["first_seen"])
-    state["version"] = 13
+    state["version"] = 14
     return state
 
 
@@ -595,8 +600,15 @@ def extract_candidates(html_text, page_url, site, scan):
         title = clean_text(a.get_text(" ", strip=True), 300)
         if _is_generic_title(title):
             continue
-        parent = a.find_parent(["li", "td", "article", "section", "div"])
+
+        # FIX 2: Prefer <tr> so date (in sibling <td>) is included in context
+        parent = a.find_parent("tr")
+        if parent is None:
+            parent = a.find_parent(["li", "article", "section"])
+        if parent is None:
+            parent = a.find_parent(["div", "td"])
         context = clean_text(parent.get_text(" ", strip=True) if parent else "", 700)
+
         if _is_language_selector(title):
             parent_text = clean_text(parent.get_text(" ", strip=True) if parent else "", 300)
             for lang in _LANGUAGE_SELECTOR_TITLES:
@@ -608,6 +620,7 @@ def extract_candidates(html_text, page_url, site, scan):
                 title = parent_text
             else:
                 continue
+
         score = local_score(title, href, context, keywords)
         pdf_bonus = 1 if is_pdf(href) else 0
         if score <= 0 and pdf_bonus == 0:
@@ -1203,59 +1216,44 @@ def _safe_str(value, limit=300):
 
 
 _LABELS_HI = {
-    # Vacancy
     "total_posts": "कुल पद", "post_breakdown": "पद की जानकारी",
     "qualification": "योग्यता", "age_limit": "उम्र सीमा",
     "pay_scale": "वेतन", "application_fee": "फ़ीस / चार्जेस",
     "last_date": "आख़िरी तारीख़", "apply_online": "ऑनलाइन अप्लाई करें",
-    # Result
     "result_for": "रिजल्ट किसका है", "declared_on": "रिजल्ट की तारीख़",
     "check_result": "रिजल्ट देखें", "session": "सत्र",
     "semester": "सेमेस्टर",
     "rechecking_last_date": "रीचेकिंग आख़िरी तारीख़", "rechecking_link": "रीचेकिंग लिंक",
-    # Admit card
     "exam": "एग्ज़ाम", "exam_date": "एग्ज़ाम की तारीख़",
     "download_admit_card": "एडमिट कार्ड डाउनलोड करें",
     "download_start_date": "डाउनलोड शुरू", "download_last_date": "डाउनलोड आख़िरी",
-    # Answer key
     "view_answer_key": "आंसर की देखें",
     "objection_start_date": "आपत्ति शुरू", "objection_last_date": "आपत्ति आख़िरी",
     "objection_fee": "आपत्ति शुल्क", "objection_link": "आपत्ति दर्ज करें",
-    # Admission
     "course": "कोर्स", "university_name": "यूनिवर्सिटी",
     "counselling_date": "काउंसलिंग तारीख़", "counselling_time": "समय",
     "venue": "स्थान",
-    # Scholarship
     "scheme_name": "स्कीम", "amount": "अमाउंट / रकम",
     "eligibility": "कौन अप्लाई कर सकता है", "applicable_category": "किस श्रेणी के लिए",
     "income_limit": "आय सीमा",
-    # Exam schedule
     "exam_start_date": "एग्ज़ाम शुरू", "exam_end_date": "एग्ज़ाम ख़त्म",
     "exam_time": "एग्ज़ाम का समय", "timetable_link": "टाइम टेबल देखें",
-    # Counselling
     "round": "राउंड",
-    # Tender
     "tender_no": "निविदा संख्या", "work_description": "कार्य विवरण",
     "issuing_authority": "जारीकर्ता विभाग", "estimated_cost": "अनुमानित लागत",
     "emd_amount": "EMD / बयाना राशि", "tender_fee": "निविदा शुल्क",
     "submission_last_date": "जमा आख़िरी", "opening_date": "खोलने की तारीख़",
     "submission_mode": "जमा तरीक़ा", "download_tender": "निविदा डाउनलोड करें",
-    # Gazette
     "gazette_no": "गजट संख्या", "gazette_type": "गजट प्रकार",
     "publication_date": "प्रकाशन तारीख़", "gazette_link": "गजट देखें",
-    # Land revenue
     "notification_no": "अधिसूचना संख्या", "land_location": "भूमि स्थान",
     "affected_area": "प्रभावित क्षेत्र", "notification_type": "अधिसूचना प्रकार",
     "effective_date": "प्रभावी तारीख़", "order_link": "आदेश देखें",
-    # Press release
     "issuing_department": "विभाग", "release_date": "जारी तारीख़",
     "reference_no": "संदर्भ संख्या", "release_link": "प्रेस रिलीज़ देखें",
-    # Publication
     "publication_name": "प्रकाशन", "publication_type": "प्रकार",
     "publisher": "प्रकाशक", "download_link": "डाउनलोड करें",
-    # Notice
     "subject": "विषय",
-    # Common
     "read_full": "पूरी नोटिफिकेशन देखें",
 }
 
@@ -1365,8 +1363,6 @@ def _link_line(lines, emoji, label, url):
     if url:
         lines.append(f'{emoji} <a href="{html.escape(url, quote=True)}">{html.escape(_labels(label))}</a>')
 
-
-# ---------- Category formatters ----------
 
 def _format_vacancy(lines, c):
     total = c.get("total_posts")
