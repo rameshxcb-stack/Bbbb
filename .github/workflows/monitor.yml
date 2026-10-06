@@ -41,6 +41,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          NOTIFY_LANGUAGE: "both"
         run: |
           python monitor.py
 
@@ -58,6 +59,10 @@ jobs:
       - name: Rebase and push state
         if: always()
         run: |
-          git fetch origin "${GITHUB_REF_NAME}"
-          git rebase "origin/${GITHUB_REF_NAME}"
-          git push origin "HEAD:${GITHUB_REF_NAME}"
+          for i in 1 2 3 4 5; do
+            git fetch origin "${GITHUB_REF_NAME}" && \
+              git rebase "origin/${GITHUB_REF_NAME}" && \
+              git push origin "HEAD:${GITHUB_REF_NAME}" && break
+            echo "Push attempt $i failed, retrying in 5s..."
+            sleep 5
+          done
