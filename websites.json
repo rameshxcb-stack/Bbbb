@@ -6,7 +6,7 @@
     "max_items_per_site": 100,
     "max_discovery_pages_per_site": 5,
     "max_new_items_per_run": 30,
-    "gemini_batch_size": 4,
+    "gemini_batch_size": 3,
     "gemini_max_calls_per_run": 25,
     "retention_days": 90,
     "max_pending_attempts": 12,
