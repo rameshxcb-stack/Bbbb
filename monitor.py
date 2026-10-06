@@ -31,12 +31,10 @@ FALLBACK_MODELS = [
 ]
 
 FUZZY_DUPLICATE_THRESHOLD = 95
-
 MAX_PDF_BYTES = 5 * 1024 * 1024
 MAX_PDF_PAGES = 3
 MAX_PDF_TEXT_CHARS = 2500
 MAX_PDF_ATTEMPTS = 3
-
 TELEGRAM_SAFE_LIMIT = 4000
 
 NOTIFY_LANGUAGE = os.getenv("NOTIFY_LANGUAGE", "both").strip().lower()
@@ -47,7 +45,7 @@ STALE_NOTICE_DAYS = int(os.getenv("STALE_NOTICE_DAYS", "30"))
 
 USER_AGENT = os.getenv(
     "MONITOR_USER_AGENT",
-    "Mozilla/5.0 (compatible; JharkhandNoticeMonitor/5.3)"
+    "Mozilla/5.0 (compatible; JharkhandNoticeMonitor/5.5)"
 )
 
 STRONG_KEYWORDS = [
@@ -61,7 +59,7 @@ STRONG_KEYWORDS = [
 
 
 # ---------------------------------------------------------------------------
-# Navigation / listing page filters
+# Navigation filters
 # ---------------------------------------------------------------------------
 
 _NON_NOTICE_URL_PATTERNS = [
@@ -116,7 +114,7 @@ _EMPTY_PAGE_PHRASES = [
 ]
 
 
-def _is_navigation_url(url: str) -> bool:
+def _is_navigation_url(url):
     try:
         parsed = urlparse(url)
         target = (parsed.path or "") + ("?" + parsed.query if parsed.query else "")
@@ -128,7 +126,7 @@ def _is_navigation_url(url: str) -> bool:
     return False
 
 
-def _is_generic_title(title: str) -> bool:
+def _is_generic_title(title):
     t = (title or "").strip().lower()
     if not t:
         return True
@@ -141,7 +139,7 @@ def _is_generic_title(title: str) -> bool:
     return False
 
 
-def _is_language_selector(title: str) -> bool:
+def _is_language_selector(title):
     t = (title or "").strip().lower()
     if not t:
         return False
@@ -155,7 +153,7 @@ def _is_language_selector(title: str) -> bool:
     return False
 
 
-def _is_empty_page_text(html_text: str) -> bool:
+def _is_empty_page_text(html_text):
     if not html_text:
         return False
     sample = html_text[:8000].lower()
@@ -163,25 +161,22 @@ def _is_empty_page_text(html_text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Full-date extraction (with Hindi month support)
+# Dates
 # ---------------------------------------------------------------------------
 
 _MONTH_NAMES = {
-    # English
     "january": 1, "jan": 1, "february": 2, "feb": 2,
     "march": 3, "mar": 3, "april": 4, "apr": 4,
     "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7,
     "august": 8, "aug": 8, "september": 9, "sep": 9, "sept": 9,
     "october": 10, "oct": 10, "november": 11, "nov": 11,
     "december": 12, "dec": 12,
-    # Hindi (Devanagari)
     "जनवरी": 1, "फरवरी": 2, "मार्च": 3, "अप्रैल": 4,
     "मई": 5, "जून": 6, "जुलाई": 7, "अगस्त": 8,
     "सितंबर": 9, "सितम्बर": 9, "अक्टूबर": 10, "अक्तूबर": 10,
     "नवंबर": 11, "नवम्बर": 11, "दिसंबर": 12, "दिसम्बर": 12,
 }
 
-# English month names for regex (Hindi months rarely appear in full-date pattern)
 _MONTH_REGEX = (
     r"jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|"
     r"january|february|march|april|june|july|august|"
@@ -191,24 +186,15 @@ _MONTH_REGEX = (
 _FULL_DATE_PATTERNS = [
     re.compile(r"\b(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})\b"),
     re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b"),
-    re.compile(
-        r"\b(\d{1,2})(?:st|nd|rd|th)?[\s\-]+"
-        r"(" + _MONTH_REGEX + r")"
-        r"[\s\-,]+(\d{4})\b",
-        re.I,
-    ),
-    re.compile(
-        r"\b(" + _MONTH_REGEX + r")"
-        r"[\s\-]+(\d{1,2})(?:st|nd|rd|th)?[\s\-,]+(\d{4})\b",
-        re.I,
-    ),
+    re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)?[\s\-]+(" + _MONTH_REGEX + r")[\s\-,]+(\d{4})\b", re.I),
+    re.compile(r"\b(" + _MONTH_REGEX + r")[\s\-]+(\d{1,2})(?:st|nd|rd|th)?[\s\-,]+(\d{4})\b", re.I),
 ]
 
 
-def _extract_full_dates(text: str) -> List[datetime]:
+def _extract_full_dates(text):
     if not text:
         return []
-    dates: List[datetime] = []
+    dates = []
     for pat in _FULL_DATE_PATTERNS:
         for m in pat.finditer(text):
             try:
@@ -219,13 +205,9 @@ def _extract_full_dates(text: str) -> List[datetime]:
                 if a.isdigit() and len(a) == 4:
                     y, mo, d = int(a), int(b), int(c)
                 elif b.isalpha() or (b and not b.isdigit()):
-                    d = int(a)
-                    mo = _MONTH_NAMES.get(b.lower(), 0)
-                    y = int(c)
+                    d = int(a); mo = _MONTH_NAMES.get(b.lower(), 0); y = int(c)
                 elif a and not a.isdigit():
-                    mo = _MONTH_NAMES.get(a.lower(), 0)
-                    d = int(b)
-                    y = int(c)
+                    mo = _MONTH_NAMES.get(a.lower(), 0); d = int(b); y = int(c)
                 else:
                     d, mo, y = int(a), int(b), int(c)
                 if not (1 <= mo <= 12 and 1 <= d <= 31):
@@ -238,49 +220,15 @@ def _extract_full_dates(text: str) -> List[datetime]:
     return dates
 
 
-# ---------------------------------------------------------------------------
-# Upload date extraction (authoritative source)
-# ---------------------------------------------------------------------------
-
 _UPLOAD_DATE_TEXT_PATTERNS = [
-    re.compile(
-        r"(?:published|posted|uploaded|issued|dated)"
-        r"\s*(?:on|at|:|\-)?\s*"
-        r"(\d{1,2}[/\-.]\d{1,2}[/\-.]\d{4})",
-        re.I,
-    ),
-    re.compile(
-        r"(?:published|posted|uploaded|issued|dated)"
-        r"\s*(?:on|at|:|\-)?\s*"
-        r"(\d{1,2}(?:st|nd|rd|th)?\s+"
-        r"(?:" + _MONTH_REGEX + r")"
-        r"\s+\d{4})",
-        re.I,
-    ),
-    re.compile(
-        r"(?:दिनांक|प्रकाशित|जारी|अपलोड|अद्यतन)"
-        r"\s*[:\-]?\s*"
-        r"(\d{1,2}[/\-.]\d{1,2}[/\-.]\d{4})",
-        re.I,
-    ),
+    re.compile(r"(?:published|posted|uploaded|issued|dated)\s*(?:on|at|:|\-)?\s*(\d{1,2}[/\-.]\d{1,2}[/\-.]\d{4})", re.I),
+    re.compile(r"(?:published|posted|uploaded|issued|dated)\s*(?:on|at|:|\-)?\s*(\d{1,2}(?:st|nd|rd|th)?\s+(?:" + _MONTH_REGEX + r")\s+\d{4})", re.I),
+    re.compile(r"(?:दिनांक|प्रकाशित|जारी|अपलोड|अद्यतन)\s*[:\-]?\s*(\d{1,2}[/\-.]\d{1,2}[/\-.]\d{4})", re.I),
 ]
 
 
-def _extract_upload_date(anchor_tag) -> Optional[datetime]:
-    """
-    Extract publication/upload date near a link.
-
-    Priority for search_root:
-      1. <tr>        (NIC table sites — date in sibling <td>)  ← CRITICAL
-      2. <li>        (list-based sites)
-      3. <article>   (WordPress-style sites)
-      4. <div>/<section>  (fallback — riskier)
-      5. anchor's parent (last resort)
-
-    Returns timezone-aware datetime or None.
-    """
+def _extract_upload_date(anchor_tag):
     try:
-        # Prefer <tr> first — critical for NIC table-based sites
         search_root = (
             anchor_tag.find_parent("tr")
             or anchor_tag.find_parent("li")
@@ -288,11 +236,8 @@ def _extract_upload_date(anchor_tag) -> Optional[datetime]:
             or anchor_tag.find_parent(["div", "section"])
             or anchor_tag.parent
         )
-
         if not search_root:
             return None
-
-        # 1. <time datetime="...">
         time_tag = search_root.find("time")
         if time_tag:
             raw = time_tag.get("datetime") or time_tag.get_text(strip=True)
@@ -308,8 +253,6 @@ def _extract_upload_date(anchor_tag) -> Optional[datetime]:
                 ds = _extract_full_dates(raw)
                 if ds:
                     return ds[0]
-
-        # 2. Text patterns ("Published:", "दिनांक:", etc.)
         text = search_root.get_text(" ", strip=True)
         for pat in _UPLOAD_DATE_TEXT_PATTERNS:
             m = pat.search(text)
@@ -319,38 +262,18 @@ def _extract_upload_date(anchor_tag) -> Optional[datetime]:
                     return ds[0]
     except Exception:
         pass
-
     return None
 
 
-def _is_stale_notice(
-    title: str,
-    context: str,
-    url: str,
-    upload_date: Optional[datetime] = None,
-) -> bool:
-    """
-    Decide if a notice is too old to alert.
-
-    Priority:
-      0. Upload date (authoritative) — if available, use it.
-      1. Full date in content ("21 March 2021", "05/11/2026").
-      2. Year-only mentions → IGNORE (weak signal, allow).
-
-    Returns True only when we have STRONG evidence of old age.
-    """
+def _is_stale_notice(title, context, url, upload_date=None):
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=STALE_NOTICE_DAYS)
-
-    # ---- Level 0: authoritative upload date ---------------------------
     if upload_date is not None:
         if upload_date.tzinfo is None:
             upload_date = upload_date.replace(tzinfo=timezone.utc)
         if upload_date > now:
-            return False   # Future date → allow
+            return False
         return upload_date < cutoff
-
-    # ---- Level 1: full date in content --------------------------------
     haystack = f"{title} {context}".strip()
     all_dates = _extract_full_dates(haystack)
     if all_dates:
@@ -358,8 +281,6 @@ def _is_stale_notice(
         if latest > now:
             return False
         return latest < cutoff
-
-    # ---- Level 2: no signal → allow -----------------------------------
     return False
 
 
@@ -367,16 +288,16 @@ def _is_stale_notice(
 # Utilities
 # ---------------------------------------------------------------------------
 
-def utc_now() -> str:
+def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def clean_text(value: str, limit: int = 500) -> str:
+def clean_text(value, limit=500):
     value = re.sub(r"\s+", " ", value or "").strip()
     return value[:limit]
 
 
-def load_json(path: Path, default: Any) -> Any:
+def load_json(path, default):
     try:
         with path.open("r", encoding="utf-8") as f:
             return json.load(f)
@@ -386,7 +307,7 @@ def load_json(path: Path, default: Any) -> Any:
         raise RuntimeError(f"Invalid JSON in {path.name}: {exc}") from exc
 
 
-def atomic_save_json(path: Path, data: Any) -> None:
+def atomic_save_json(path, data):
     tmp = path.with_suffix(path.suffix + ".tmp")
     with tmp.open("w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -396,7 +317,7 @@ def atomic_save_json(path: Path, data: Any) -> None:
     os.replace(tmp, path)
 
 
-def canonical_url(raw: str) -> str:
+def canonical_url(raw):
     raw = (raw or "").strip()
     p = urlparse(raw)
     if not p.scheme or not p.netloc:
@@ -404,19 +325,19 @@ def canonical_url(raw: str) -> str:
     return urlunparse((p.scheme.lower(), p.netloc.lower(), p.path or "/", "", p.query, ""))
 
 
-def same_host(a: str, b: str) -> bool:
+def same_host(a, b):
     return urlparse(a).netloc.lower() == urlparse(b).netloc.lower()
 
 
-def is_http_url(url: str) -> bool:
+def is_http_url(url):
     return urlparse(url).scheme in {"http", "https"}
 
 
-def is_pdf(url: str) -> bool:
+def is_pdf(url):
     return urlparse(url).path.lower().endswith(".pdf")
 
 
-def make_session() -> requests.Session:
+def make_session():
     session = requests.Session()
     retry = Retry(
         total=3, connect=3, read=3, status=3,
@@ -442,11 +363,10 @@ def make_session() -> requests.Session:
 # Config
 # ---------------------------------------------------------------------------
 
-def get_config() -> Dict[str, Any]:
+def get_config():
     cfg = load_json(CONFIG_FILE, {})
     if not isinstance(cfg, dict):
         raise RuntimeError("websites.json root must be an object")
-
     scan = cfg.get("scan") or {}
     defaults = {
         "request_timeout_seconds": 25,
@@ -477,7 +397,6 @@ def get_config() -> Dict[str, Any]:
     scan["max_pending_attempts"] = max(1, int(scan["max_pending_attempts"]))
     scan["stale_notice_days"] = max(1, int(scan["stale_notice_days"]))
     scan["sitemap_enabled"] = bool(scan["sitemap_enabled"])
-
     scan["keywords"] = [clean_text(str(x), 80).lower() for x in scan.get("keywords", []) if str(x).strip()]
     scan["discovery_keywords"] = [clean_text(str(x), 80).lower() for x in scan.get("discovery_keywords", []) if str(x).strip()]
     cfg["scan"] = scan
@@ -495,7 +414,6 @@ def get_config() -> Dict[str, Any]:
         site["name"] = clean_text(str(site.get("name", "Unnamed Site")), 120)
         site["url"] = canonical_url(str(site.get("url", "")))
         site["id"] = clean_text(str(site.get("id", site["name"])), 100)
-
         if not site["name"] or not is_http_url(site["url"]):
             print(f"[WARN] Skipping invalid site: {raw_site}")
             continue
@@ -503,11 +421,9 @@ def get_config() -> Dict[str, Any]:
             print(f"[WARN] Duplicate site id skipped: {site['id']}")
             continue
         ids.add(site["id"])
-
         site["keywords"] = [clean_text(str(x), 80).lower() for x in site.get("keywords", []) if str(x).strip()]
         site["discovery_keywords"] = [clean_text(str(x), 80).lower() for x in site.get("discovery_keywords", []) if str(x).strip()]
         enabled.append(site)
-
     cfg["websites"] = enabled
     return cfg
 
@@ -516,9 +432,9 @@ def get_config() -> Dict[str, Any]:
 # State
 # ---------------------------------------------------------------------------
 
-def default_state() -> Dict[str, Any]:
+def default_state():
     return {
-        "version": 11,
+        "version": 13,
         "initialized": False,
         "last_run": None,
         "items": {},
@@ -527,11 +443,10 @@ def default_state() -> Dict[str, Any]:
     }
 
 
-def load_state() -> Dict[str, Any]:
+def load_state():
     state = load_json(STATE_FILE, default_state())
     if not isinstance(state, dict):
         state = default_state()
-
     state.setdefault("version", 1)
     state.setdefault("initialized", False)
     state.setdefault("last_run", None)
@@ -540,7 +455,6 @@ def load_state() -> Dict[str, Any]:
     state.setdefault("stats", {})
     for key in ("runs", "sent", "ignored", "pending", "errors"):
         state["stats"].setdefault(key, 0)
-
     for record in state["items"].values():
         if not isinstance(record, dict):
             continue
@@ -562,12 +476,11 @@ def load_state() -> Dict[str, Any]:
         record.setdefault("upload_date", None)
         record.setdefault("first_seen", utc_now())
         record.setdefault("last_seen", record["first_seen"])
-
-    state["version"] = 11
+    state["version"] = 13
     return state
 
 
-def site_state(state: Dict[str, Any], site_id: str) -> Dict[str, Any]:
+def site_state(state, site_id):
     s = state.setdefault("sites", {}).setdefault(site_id, {})
     s.setdefault("baseline_complete", False)
     s.setdefault("consecutive_failures", 0)
@@ -579,7 +492,7 @@ def site_state(state: Dict[str, Any], site_id: str) -> Dict[str, Any]:
     return s
 
 
-def mark_site_success(state: Dict[str, Any], site_id: str, count: int) -> None:
+def mark_site_success(state, site_id, count):
     s = site_state(state, site_id)
     s["consecutive_failures"] = 0
     s["last_success"] = utc_now()
@@ -588,7 +501,7 @@ def mark_site_success(state: Dict[str, Any], site_id: str, count: int) -> None:
     s["last_item_count"] = count
 
 
-def mark_site_failure(state: Dict[str, Any], site_id: str, error: str) -> None:
+def mark_site_failure(state, site_id, error):
     s = site_state(state, site_id)
     s["consecutive_failures"] += 1
     s["total_failures"] += 1
@@ -597,15 +510,15 @@ def mark_site_failure(state: Dict[str, Any], site_id: str, error: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Scoring / IDs
+# Scoring / IDs / Dedup
 # ---------------------------------------------------------------------------
 
-def local_score(title: str, url: str, context: str, keywords: List[str]) -> int:
+def local_score(title, url, context, keywords):
     text = f"{title} {url} {context}".lower()
     return sum(1 for kw in keywords if kw and kw in text)
 
 
-def item_id(site_id: str, url: str, title: str, context: str = "") -> str:
+def item_id(site_id, url, title, context=""):
     fingerprint = hashlib.sha256(
         clean_text(f"{title}|{context}", 900).lower().encode()
     ).hexdigest()[:12]
@@ -613,15 +526,11 @@ def item_id(site_id: str, url: str, title: str, context: str = "") -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
-# ---------------------------------------------------------------------------
-# Fuzzy dedup
-# ---------------------------------------------------------------------------
-
-def _normalize_title(title: str) -> str:
+def _normalize_title(title):
     return re.sub(r"[^\w\s]", " ", (title or "").lower()).strip()
 
 
-def _url_path_segments(url: str) -> set:
+def _url_path_segments(url):
     try:
         path = urlparse(url).path.strip("/").lower()
         return {seg for seg in path.split("/") if seg and len(seg) > 2}
@@ -629,8 +538,8 @@ def _url_path_segments(url: str) -> set:
         return set()
 
 
-def build_site_index(state: Dict[str, Any]) -> Dict[str, List[Tuple[str, str, str]]]:
-    index: Dict[str, List[Tuple[str, str, str]]] = {}
+def build_site_index(state):
+    index = {}
     for iid, record in state.get("items", {}).items():
         if not isinstance(record, dict):
             continue
@@ -674,25 +583,20 @@ def extract_candidates(html_text, page_url, site, scan):
     soup = BeautifulSoup(html_text, "html.parser")
     for tag in soup(["script", "style", "noscript", "svg", "template"]):
         tag.decompose()
-
     keywords = list(dict.fromkeys(scan["keywords"] + site.get("keywords", [])))
     out = []
     seen = set()
-
     for a in soup.find_all("a", href=True):
         href = canonical_url(urljoin(page_url, a.get("href", "")))
         if not is_http_url(href) or not same_host(page_url, href):
             continue
         if _is_navigation_url(href):
             continue
-
         title = clean_text(a.get_text(" ", strip=True), 300)
         if _is_generic_title(title):
             continue
-
         parent = a.find_parent(["li", "td", "article", "section", "div"])
         context = clean_text(parent.get_text(" ", strip=True) if parent else "", 700)
-
         if _is_language_selector(title):
             parent_text = clean_text(parent.get_text(" ", strip=True) if parent else "", 300)
             for lang in _LANGUAGE_SELECTOR_TITLES:
@@ -704,7 +608,6 @@ def extract_candidates(html_text, page_url, site, scan):
                 title = parent_text
             else:
                 continue
-
         score = local_score(title, href, context, keywords)
         pdf_bonus = 1 if is_pdf(href) else 0
         if score <= 0 and pdf_bonus == 0:
@@ -712,10 +615,7 @@ def extract_candidates(html_text, page_url, site, scan):
         if href in seen:
             continue
         seen.add(href)
-
-        # Extract upload date (authoritative if present)
         upload_dt = _extract_upload_date(a)
-
         out.append({
             "url": href,
             "title": title or clean_text(context, 180) or href.rsplit("/", 1)[-1],
@@ -725,7 +625,6 @@ def extract_candidates(html_text, page_url, site, scan):
             "score": score + pdf_bonus,
             "upload_date": upload_dt.isoformat() if upload_dt else None,
         })
-
     out.sort(key=lambda x: (-x["score"], x["title"].lower()))
     return out[: scan["max_items_per_site"]]
 
@@ -758,33 +657,26 @@ def discover_site(session, site, scan):
     base_url = site["url"]
     timeout = scan["request_timeout_seconds"]
     max_pages = scan["max_discovery_pages_per_site"]
-
     discovery_keywords = list(dict.fromkeys(
         scan["discovery_keywords"] + site.get("discovery_keywords", []) + scan["keywords"]
     ))
-
     queue = [base_url]
     queue.extend(discover_from_sitemap(session, base_url, scan))
-
     visited = set()
     candidates = {}
     errors = []
     successful_pages = 0
-
     while queue and len(visited) < max_pages:
         page = canonical_url(queue.pop(0))
         if page in visited or not same_host(base_url, page):
             continue
         visited.add(page)
-
         try:
             response = session.get(page, timeout=timeout, allow_redirects=True)
             if response.status_code >= 400:
                 raise RuntimeError(f"HTTP {response.status_code}")
-
             final_url = canonical_url(response.url)
             content_type = response.headers.get("content-type", "").lower()
-
             if is_pdf(final_url) or "application/pdf" in content_type:
                 filename = final_url.rsplit("/", 1)[-1] or "PDF Notice"
                 candidates[final_url] = {
@@ -794,22 +686,17 @@ def discover_site(session, site, scan):
                 }
                 successful_pages += 1
                 continue
-
             if content_type and "html" not in content_type and "xhtml" not in content_type:
                 continue
-
             if _is_empty_page_text(response.text):
                 successful_pages += 1
                 continue
-
             found = extract_candidates(response.text, final_url, site, scan)
             for row in found:
                 old = candidates.get(row["url"])
                 if old is None or row["score"] > old["score"]:
                     candidates[row["url"]] = row
-
             successful_pages += 1
-
             soup = BeautifulSoup(response.text, "html.parser")
             for a in soup.find_all("a", href=True):
                 href = canonical_url(urljoin(final_url, a.get("href", "")))
@@ -825,10 +712,8 @@ def discover_site(session, site, scan):
                     queue.append(href)
                     if len(queue) >= max_pages * 2:
                         break
-
         except Exception as exc:
             errors.append(f"{page}: {clean_text(str(exc), 250)}")
-
     values = list(candidates.values())
     values.sort(key=lambda x: (-x["score"], x["title"].lower()))
     return (site["id"], values[: scan["max_items_per_site"]], errors, successful_pages > 0)
@@ -839,7 +724,7 @@ def scan_site(site, scan):
 
 
 # ---------------------------------------------------------------------------
-# PDF extraction
+# PDF
 # ---------------------------------------------------------------------------
 
 def download_pdf_text(session, pdf_url, timeout=30):
@@ -873,7 +758,7 @@ def download_pdf_text(session, pdf_url, timeout=30):
 
 
 # ---------------------------------------------------------------------------
-# Gemini classification
+# Gemini
 # ---------------------------------------------------------------------------
 
 def keyword_fallback(items):
@@ -897,6 +782,16 @@ def keyword_fallback(items):
             category = "admission"
         elif any(k in text for k in ("tender", "निविदा")):
             category = "tender"
+        elif any(k in text for k in ("gazette", "राजपत्र")):
+            category = "gazette"
+        elif any(k in text for k in ("land acquisition", "भू-अर्जन", "revenue notification")):
+            category = "land_revenue"
+        elif any(k in text for k in ("press release", "प्रेस विज्ञप्ति")):
+            category = "press_release"
+        elif any(k in text for k in ("announcement", "advertisement", "घोषणा")):
+            category = "announcement"
+        elif "publication" in text:
+            category = "publication"
         result[str(index)] = {
             "important": important, "category": category,
             "summary": clean_text(item.get("title", ""), 180),
@@ -907,56 +802,112 @@ def keyword_fallback(items):
 def _build_prompt(prompt_items):
     return (
         "You classify and extract details from links on official "
-        "Indian government/district websites. "
+        "Jharkhand district websites (nic.in). "
         "Return JSON only using the exact schema below.\n\n"
         "CRITICAL — set important=false for ALL of these:\n"
-        "- Language selector links (titles like 'हिन्दी', 'English', 'संताली')\n"
-        "- Category listing pages (e.g. 'Announcement/Advertisement', 'Notices')\n"
-        "- Archive / past-notices pages\n"
-        "- Pagination pages (URLs containing '/page/2/', '?page=', etc.)\n"
-        "- Navigation pages (Home, Contact, About, Gallery, Departments)\n"
-        "- Pages with titles like: 'Archive', 'More', '»', 'Next', 'Previous', "
-        "  just numbers, or empty titles\n"
-        "- Pages that say 'Sorry, no notice matched this category' or "
-        "  'no records found' or 'no data found'\n"
-        "- Generic description like 'listing page', 'category page', "
-        "  'announcements and advertisements listing page'\n\n"
-        "Set important=true ONLY for genuine, specific notices such as:\n"
-        "- A specific recruitment/vacancy notice (with post details)\n"
-        "- A specific result / admit card / answer key\n"
-        "- A specific scholarship / admission notice\n"
-        "- A specific tender notice\n"
-        "- A specific appointment/order notification\n\n"
-        "For EACH item, determine:\n"
+        "- Language selector links (titles like 'हिन्दी', 'English')\n"
+        "- Category listing pages, archive pages, pagination pages\n"
+        "- Navigation pages (Home, Contact, About, Gallery)\n"
+        "- Pages with titles like 'Archive', 'More', '»', numbers, empty\n"
+        "- 'Sorry, no notice matched', 'no records found', 'no data found'\n"
+        "- Generic descriptions like 'listing page', 'category page'\n"
+        "- Birth and death figures, COVID-19 updates, cause lists, "
+        "tour programs, holiday lists, generic events\n\n"
+        "Set important=true ONLY for genuine, specific notices.\n\n"
+        "For EACH item determine:\n"
         "1. important (true/false)\n"
-        "2. category — one of: 'vacancy', 'result', 'admit_card', "
-        "'answer_key', 'scholarship', 'admission', 'tender', 'notice', 'other'\n"
-        "3. summary — 1-line summary (<= 150 chars).\n\n"
-        "IMPORTANT: If 'pdf_text' is provided, treat it as PRIMARY source "
-        "for extracting details. 'context' is secondary.\n\n"
-        "If category is 'vacancy', ALSO extract (use null if not available):\n"
-        "- total_posts (integer)\n"
-        "- post_details: array of {post_name, category (UR/OBC/SC/ST/EWS/Other), vacancies}\n"
-        "- qualification (string)\n- age_limit (string)\n"
-        "- pay_scale (string)\n- application_fee (string)\n"
-        "- last_date (string)\n- apply_link (string URL)\n\n"
-        "If category is 'result': result_for, result_date, result_link\n"
-        "If category is 'admit_card': exam_name, exam_date, admit_card_link\n"
-        "If category is 'answer_key': exam_name, answer_key_link\n"
-        "If category is 'scholarship': scholarship_amount, eligibility, last_date\n"
-        "If category is 'admission': course_name, last_date, apply_link\n\n"
+        "2. category — one of: 'vacancy', 'result', 'admit_card', 'answer_key', "
+        "'admission', 'counselling', 'scholarship', 'exam_schedule', "
+        "'tender', 'gazette', 'land_revenue', 'press_release', "
+        "'announcement', 'publication', 'notice', 'other'\n"
+        "3. summary — 1-line summary (<= 150 chars)\n\n"
+        "IMPORTANT: If 'pdf_text' is provided, treat it as PRIMARY source.\n\n"
+
+        "── CATEGORY-SPECIFIC EXTRACTION ──\n\n"
+
+        "VACANCY: total_posts (int), post_details (array of "
+        "{post_name, category (UR/OBC/SC/ST/EWS), vacancies}), qualification, "
+        "age_limit, pay_scale, application_fee, last_date, apply_link\n\n"
+
+        "RESULT: result_for, exam_name, session, semester, result_date, "
+        "result_link, rechecking_last_date, rechecking_link\n\n"
+
+        "ADMIT_CARD: exam_name, session, semester, exam_date, "
+        "download_start_date, download_last_date, roll_no_required, admit_card_link\n\n"
+
+        "ANSWER_KEY: exam_name, session, objection_start_date, "
+        "objection_last_date, objection_fee, answer_key_link, objection_link\n\n"
+
+        "ADMISSION: course_name, session, university_name, eligibility, "
+        "application_fee, last_date, counselling_date, apply_link\n\n"
+
+        "COUNSELLING: course_name, round, counselling_date, "
+        "counselling_time, venue, apply_link\n\n"
+
+        "SCHOLARSHIP: scheme_name, scholarship_amount, eligibility, "
+        "applicable_category, income_limit, last_date, apply_link\n\n"
+
+        "EXAM_SCHEDULE: exam_name, session, semester, course, "
+        "exam_start_date, exam_end_date, exam_time, timetable_link\n\n"
+
+        "TENDER: tender_no, work_description, issuing_authority, "
+        "estimated_cost, emd_amount, tender_fee, submission_last_date, "
+        "opening_date, submission_mode, apply_link\n\n"
+
+        "GAZETTE: gazette_no, gazette_type (E-Gazette/Gazetteer/Official), "
+        "subject, issuing_authority, publication_date, gazette_link\n\n"
+
+        "LAND_REVENUE: notification_no, subject, "
+        "land_location (village/plot), affected_area, "
+        "notification_type (Acquisition/Revenue/Transfer), "
+        "issuing_authority, effective_date, order_link\n\n"
+
+        "PRESS_RELEASE: subject, issuing_department, release_date, "
+        "reference_no, release_link\n\n"
+
+        "ANNOUNCEMENT: subject, issuing_authority, reference_no, "
+        "effective_date, apply_link\n\n"
+
+        "PUBLICATION: publication_name, publication_type, "
+        "publisher, publication_date, download_link\n\n"
+
+        "NOTICE: subject, reference_no, issuing_authority, "
+        "effective_date, order_link\n\n"
+
         "Do NOT invent facts. Use null when unsure.\n\n"
+
         "Schema:\n"
         '{"items":[{'
         '"id":"0","important":true,"category":"vacancy","summary":"...",'
-        '"total_posts":10,'
-        '"post_details":[{"post_name":"...","category":"UR","vacancies":5}],'
-        '"qualification":"...","age_limit":"...","pay_scale":"...",'
-        '"application_fee":"...","last_date":"...","apply_link":"...",'
-        '"result_for":null,"result_date":null,"result_link":null,'
-        '"exam_name":null,"exam_date":null,"admit_card_link":null,'
-        '"answer_key_link":null,"scholarship_amount":null,"eligibility":null,'
-        '"course_name":null'
+        '"total_posts":null,"post_details":[],"qualification":null,'
+        '"age_limit":null,"pay_scale":null,"application_fee":null,'
+        '"last_date":null,"apply_link":null,'
+        '"result_for":null,"exam_name":null,"session":null,"semester":null,'
+        '"result_date":null,"result_link":null,'
+        '"rechecking_last_date":null,"rechecking_link":null,'
+        '"exam_date":null,"download_start_date":null,"download_last_date":null,'
+        '"roll_no_required":null,"admit_card_link":null,'
+        '"objection_start_date":null,"objection_last_date":null,'
+        '"objection_fee":null,"answer_key_link":null,"objection_link":null,'
+        '"course_name":null,"university_name":null,'
+        '"counselling_date":null,"counselling_time":null,"venue":null,'
+        '"round":null,'
+        '"scheme_name":null,"scholarship_amount":null,"eligibility":null,'
+        '"applicable_category":null,"income_limit":null,'
+        '"exam_start_date":null,"exam_end_date":null,"exam_time":null,'
+        '"timetable_link":null,'
+        '"tender_no":null,"work_description":null,"issuing_authority":null,'
+        '"estimated_cost":null,"emd_amount":null,"tender_fee":null,'
+        '"submission_last_date":null,"opening_date":null,"submission_mode":null,'
+        '"gazette_no":null,"gazette_type":null,"publication_date":null,'
+        '"gazette_link":null,'
+        '"notification_no":null,"land_location":null,"affected_area":null,'
+        '"notification_type":null,"effective_date":null,"order_link":null,'
+        '"issuing_department":null,"release_date":null,"reference_no":null,'
+        '"release_link":null,'
+        '"publication_name":null,"publication_type":null,"publisher":null,'
+        '"download_link":null,'
+        '"subject":null'
         '}]}\n\n'
         + json.dumps(prompt_items, ensure_ascii=False)
     )
@@ -971,6 +922,13 @@ def _parse_gemini_response(text, item_count):
         rows = parsed["items"]
     elif isinstance(parsed, list):
         rows = parsed
+
+    def _str(row, key, limit=300):
+        v = row.get(key)
+        if v is None:
+            return None
+        s = clean_text(str(v), limit)
+        return s or None
 
     result = {}
     for row in rows:
@@ -997,22 +955,73 @@ def _parse_gemini_response(text, item_count):
             "summary": clean_text(str(row.get("summary", "")), 200),
             "total_posts": row.get("total_posts"),
             "post_details": clean_posts,
-            "qualification": clean_text(str(row.get("qualification") or ""), 200) or None,
-            "age_limit": clean_text(str(row.get("age_limit") or ""), 100) or None,
-            "pay_scale": clean_text(str(row.get("pay_scale") or ""), 150) or None,
-            "application_fee": clean_text(str(row.get("application_fee") or ""), 200) or None,
-            "last_date": clean_text(str(row.get("last_date") or ""), 80) or None,
-            "apply_link": clean_text(str(row.get("apply_link") or ""), 500) or None,
-            "result_for": clean_text(str(row.get("result_for") or ""), 200) or None,
-            "result_date": clean_text(str(row.get("result_date") or ""), 80) or None,
-            "result_link": clean_text(str(row.get("result_link") or ""), 500) or None,
-            "exam_name": clean_text(str(row.get("exam_name") or ""), 200) or None,
-            "exam_date": clean_text(str(row.get("exam_date") or ""), 80) or None,
-            "admit_card_link": clean_text(str(row.get("admit_card_link") or ""), 500) or None,
-            "answer_key_link": clean_text(str(row.get("answer_key_link") or ""), 500) or None,
-            "scholarship_amount": clean_text(str(row.get("scholarship_amount") or ""), 100) or None,
-            "eligibility": clean_text(str(row.get("eligibility") or ""), 250) or None,
-            "course_name": clean_text(str(row.get("course_name") or ""), 200) or None,
+            "qualification": _str(row, "qualification", 200),
+            "age_limit": _str(row, "age_limit", 100),
+            "pay_scale": _str(row, "pay_scale", 150),
+            "application_fee": _str(row, "application_fee", 200),
+            "last_date": _str(row, "last_date", 80),
+            "apply_link": _str(row, "apply_link", 500),
+            "result_for": _str(row, "result_for", 200),
+            "exam_name": _str(row, "exam_name", 200),
+            "session": _str(row, "session", 80),
+            "semester": _str(row, "semester", 60),
+            "result_date": _str(row, "result_date", 80),
+            "result_link": _str(row, "result_link", 500),
+            "rechecking_last_date": _str(row, "rechecking_last_date", 80),
+            "rechecking_link": _str(row, "rechecking_link", 500),
+            "exam_date": _str(row, "exam_date", 80),
+            "download_start_date": _str(row, "download_start_date", 80),
+            "download_last_date": _str(row, "download_last_date", 80),
+            "roll_no_required": row.get("roll_no_required"),
+            "admit_card_link": _str(row, "admit_card_link", 500),
+            "objection_start_date": _str(row, "objection_start_date", 80),
+            "objection_last_date": _str(row, "objection_last_date", 80),
+            "objection_fee": _str(row, "objection_fee", 100),
+            "answer_key_link": _str(row, "answer_key_link", 500),
+            "objection_link": _str(row, "objection_link", 500),
+            "course_name": _str(row, "course_name", 200),
+            "university_name": _str(row, "university_name", 200),
+            "counselling_date": _str(row, "counselling_date", 80),
+            "counselling_time": _str(row, "counselling_time", 60),
+            "venue": _str(row, "venue", 200),
+            "round": _str(row, "round", 60),
+            "scheme_name": _str(row, "scheme_name", 200),
+            "scholarship_amount": _str(row, "scholarship_amount", 100),
+            "eligibility": _str(row, "eligibility", 250),
+            "applicable_category": _str(row, "applicable_category", 100),
+            "income_limit": _str(row, "income_limit", 100),
+            "exam_start_date": _str(row, "exam_start_date", 80),
+            "exam_end_date": _str(row, "exam_end_date", 80),
+            "exam_time": _str(row, "exam_time", 60),
+            "timetable_link": _str(row, "timetable_link", 500),
+            "tender_no": _str(row, "tender_no", 100),
+            "work_description": _str(row, "work_description", 300),
+            "issuing_authority": _str(row, "issuing_authority", 200),
+            "estimated_cost": _str(row, "estimated_cost", 100),
+            "emd_amount": _str(row, "emd_amount", 100),
+            "tender_fee": _str(row, "tender_fee", 100),
+            "submission_last_date": _str(row, "submission_last_date", 80),
+            "opening_date": _str(row, "opening_date", 80),
+            "submission_mode": _str(row, "submission_mode", 60),
+            "gazette_no": _str(row, "gazette_no", 100),
+            "gazette_type": _str(row, "gazette_type", 100),
+            "publication_date": _str(row, "publication_date", 80),
+            "gazette_link": _str(row, "gazette_link", 500),
+            "notification_no": _str(row, "notification_no", 100),
+            "land_location": _str(row, "land_location", 250),
+            "affected_area": _str(row, "affected_area", 100),
+            "notification_type": _str(row, "notification_type", 100),
+            "effective_date": _str(row, "effective_date", 80),
+            "order_link": _str(row, "order_link", 500),
+            "issuing_department": _str(row, "issuing_department", 200),
+            "release_date": _str(row, "release_date", 80),
+            "reference_no": _str(row, "reference_no", 100),
+            "release_link": _str(row, "release_link", 500),
+            "publication_name": _str(row, "publication_name", 200),
+            "publication_type": _str(row, "publication_type", 100),
+            "publisher": _str(row, "publisher", 200),
+            "download_link": _str(row, "download_link", 500),
+            "subject": _str(row, "subject", 200),
         }
     if not result:
         raise RuntimeError("Gemini returned no usable classifications")
@@ -1167,9 +1176,22 @@ def send_telegram(token, chat_id, text):
 # ---------------------------------------------------------------------------
 
 CATEGORY_EMOJI = {
-    "vacancy": "💼", "result": "📊", "admit_card": "🎫",
-    "answer_key": "🔑", "scholarship": "🎓", "admission": "🎓",
-    "tender": "📑", "notice": "📌", "other": "📎",
+    "vacancy": "💼",
+    "result": "📊",
+    "admit_card": "🎫",
+    "answer_key": "🔑",
+    "admission": "🎓",
+    "counselling": "🎯",
+    "scholarship": "🎓",
+    "exam_schedule": "📅",
+    "tender": "📑",
+    "gazette": "📰",
+    "land_revenue": "🏞️",
+    "press_release": "📢",
+    "announcement": "📣",
+    "publication": "📚",
+    "notice": "📌",
+    "other": "📎",
 }
 
 
@@ -1181,15 +1203,59 @@ def _safe_str(value, limit=300):
 
 
 _LABELS_HI = {
+    # Vacancy
     "total_posts": "कुल पद", "post_breakdown": "पद की जानकारी",
     "qualification": "योग्यता", "age_limit": "उम्र सीमा",
     "pay_scale": "वेतन", "application_fee": "फ़ीस / चार्जेस",
     "last_date": "आख़िरी तारीख़", "apply_online": "ऑनलाइन अप्लाई करें",
+    # Result
     "result_for": "रिजल्ट किसका है", "declared_on": "रिजल्ट की तारीख़",
-    "check_result": "रिजल्ट देखें", "exam": "एग्ज़ाम",
-    "exam_date": "एग्ज़ाम की तारीख़", "download_admit_card": "एडमिट कार्ड डाउनलोड करें",
-    "view_answer_key": "आंसर की देखें", "amount": "अमाउंट / रकम",
-    "eligibility": "कौन अप्लाई कर सकता है", "course": "कोर्स",
+    "check_result": "रिजल्ट देखें", "session": "सत्र",
+    "semester": "सेमेस्टर",
+    "rechecking_last_date": "रीचेकिंग आख़िरी तारीख़", "rechecking_link": "रीचेकिंग लिंक",
+    # Admit card
+    "exam": "एग्ज़ाम", "exam_date": "एग्ज़ाम की तारीख़",
+    "download_admit_card": "एडमिट कार्ड डाउनलोड करें",
+    "download_start_date": "डाउनलोड शुरू", "download_last_date": "डाउनलोड आख़िरी",
+    # Answer key
+    "view_answer_key": "आंसर की देखें",
+    "objection_start_date": "आपत्ति शुरू", "objection_last_date": "आपत्ति आख़िरी",
+    "objection_fee": "आपत्ति शुल्क", "objection_link": "आपत्ति दर्ज करें",
+    # Admission
+    "course": "कोर्स", "university_name": "यूनिवर्सिटी",
+    "counselling_date": "काउंसलिंग तारीख़", "counselling_time": "समय",
+    "venue": "स्थान",
+    # Scholarship
+    "scheme_name": "स्कीम", "amount": "अमाउंट / रकम",
+    "eligibility": "कौन अप्लाई कर सकता है", "applicable_category": "किस श्रेणी के लिए",
+    "income_limit": "आय सीमा",
+    # Exam schedule
+    "exam_start_date": "एग्ज़ाम शुरू", "exam_end_date": "एग्ज़ाम ख़त्म",
+    "exam_time": "एग्ज़ाम का समय", "timetable_link": "टाइम टेबल देखें",
+    # Counselling
+    "round": "राउंड",
+    # Tender
+    "tender_no": "निविदा संख्या", "work_description": "कार्य विवरण",
+    "issuing_authority": "जारीकर्ता विभाग", "estimated_cost": "अनुमानित लागत",
+    "emd_amount": "EMD / बयाना राशि", "tender_fee": "निविदा शुल्क",
+    "submission_last_date": "जमा आख़िरी", "opening_date": "खोलने की तारीख़",
+    "submission_mode": "जमा तरीक़ा", "download_tender": "निविदा डाउनलोड करें",
+    # Gazette
+    "gazette_no": "गजट संख्या", "gazette_type": "गजट प्रकार",
+    "publication_date": "प्रकाशन तारीख़", "gazette_link": "गजट देखें",
+    # Land revenue
+    "notification_no": "अधिसूचना संख्या", "land_location": "भूमि स्थान",
+    "affected_area": "प्रभावित क्षेत्र", "notification_type": "अधिसूचना प्रकार",
+    "effective_date": "प्रभावी तारीख़", "order_link": "आदेश देखें",
+    # Press release
+    "issuing_department": "विभाग", "release_date": "जारी तारीख़",
+    "reference_no": "संदर्भ संख्या", "release_link": "प्रेस रिलीज़ देखें",
+    # Publication
+    "publication_name": "प्रकाशन", "publication_type": "प्रकार",
+    "publisher": "प्रकाशक", "download_link": "डाउनलोड करें",
+    # Notice
+    "subject": "विषय",
+    # Common
     "read_full": "पूरी नोटिफिकेशन देखें",
 }
 
@@ -1199,23 +1265,58 @@ _LABELS_EN = {
     "pay_scale": "Pay Scale", "application_fee": "Application Fee",
     "last_date": "Last Date", "apply_online": "Apply Online",
     "result_for": "Result For", "declared_on": "Declared",
-    "check_result": "Check Result", "exam": "Exam",
-    "exam_date": "Exam Date", "download_admit_card": "Download Admit Card",
-    "view_answer_key": "View Answer Key", "amount": "Amount",
-    "eligibility": "Eligibility", "course": "Course",
+    "check_result": "Check Result", "session": "Session",
+    "semester": "Semester",
+    "rechecking_last_date": "Rechecking Last Date", "rechecking_link": "Rechecking Link",
+    "exam": "Exam", "exam_date": "Exam Date",
+    "download_admit_card": "Download Admit Card",
+    "download_start_date": "Download Starts", "download_last_date": "Download Last Date",
+    "view_answer_key": "View Answer Key",
+    "objection_start_date": "Objection Starts", "objection_last_date": "Objection Last Date",
+    "objection_fee": "Objection Fee", "objection_link": "File Objection",
+    "course": "Course", "university_name": "University",
+    "counselling_date": "Counselling Date", "counselling_time": "Time",
+    "venue": "Venue",
+    "scheme_name": "Scheme", "amount": "Amount",
+    "eligibility": "Eligibility", "applicable_category": "Applicable Category",
+    "income_limit": "Income Limit",
+    "exam_start_date": "Exam Starts", "exam_end_date": "Exam Ends",
+    "exam_time": "Exam Time", "timetable_link": "View Timetable",
+    "round": "Round",
+    "tender_no": "Tender No", "work_description": "Work Description",
+    "issuing_authority": "Issuing Authority", "estimated_cost": "Estimated Cost",
+    "emd_amount": "EMD", "tender_fee": "Tender Fee",
+    "submission_last_date": "Submission Last Date", "opening_date": "Opening Date",
+    "submission_mode": "Submission Mode", "download_tender": "Download Tender",
+    "gazette_no": "Gazette No", "gazette_type": "Gazette Type",
+    "publication_date": "Publication Date", "gazette_link": "View Gazette",
+    "notification_no": "Notification No", "land_location": "Land Location",
+    "affected_area": "Affected Area", "notification_type": "Notification Type",
+    "effective_date": "Effective Date", "order_link": "View Order",
+    "issuing_department": "Department", "release_date": "Release Date",
+    "reference_no": "Reference No", "release_link": "View Press Release",
+    "publication_name": "Publication", "publication_type": "Type",
+    "publisher": "Publisher", "download_link": "Download",
+    "subject": "Subject",
     "read_full": "View Full Notice",
 }
 
 _CATEGORY_NAMES_HI = {
     "vacancy": "भर्ती", "result": "रिजल्ट", "admit_card": "एडमिट कार्ड",
-    "answer_key": "आंसर की", "scholarship": "स्कॉलरशिप",
-    "admission": "एडमिशन", "tender": "टेंडर", "notice": "सूचना", "other": "अन्य",
+    "answer_key": "आंसर की", "admission": "एडमिशन", "counselling": "काउंसलिंग",
+    "scholarship": "स्कॉलरशिप", "exam_schedule": "एग्ज़ाम शेड्यूल",
+    "tender": "टेंडर", "gazette": "गजट", "land_revenue": "भू-अर्जन / राजस्व",
+    "press_release": "प्रेस रिलीज़", "announcement": "घोषणा",
+    "publication": "प्रकाशन", "notice": "सूचना", "other": "अन्य",
 }
 
 _CATEGORY_NAMES_EN = {
     "vacancy": "Vacancy", "result": "Result", "admit_card": "Admit Card",
-    "answer_key": "Answer Key", "scholarship": "Scholarship",
-    "admission": "Admission", "tender": "Tender", "notice": "Notice", "other": "Other",
+    "answer_key": "Answer Key", "admission": "Admission", "counselling": "Counselling",
+    "scholarship": "Scholarship", "exam_schedule": "Exam Schedule",
+    "tender": "Tender", "gazette": "Gazette", "land_revenue": "Land / Revenue",
+    "press_release": "Press Release", "announcement": "Announcement",
+    "publication": "Publication", "notice": "Notice", "other": "Other",
 }
 
 _DISCLAIMER_HI = "⚠️ एक बार ऑफिशियल नोटिफिकेशन ज़रूर पढ़ें — सभी डिटेल्स खुद कन्फर्म कर लें।"
@@ -1255,6 +1356,18 @@ def _disclaimer_block():
     return lines
 
 
+def _line(lines, emoji, label, value):
+    if value:
+        lines.append(f"{emoji} <b>{_labels(label)}:</b> {html.escape(str(value))}")
+
+
+def _link_line(lines, emoji, label, url):
+    if url:
+        lines.append(f'{emoji} <a href="{html.escape(url, quote=True)}">{html.escape(_labels(label))}</a>')
+
+
+# ---------- Category formatters ----------
+
 def _format_vacancy(lines, c):
     total = c.get("total_posts")
     if total:
@@ -1268,66 +1381,168 @@ def _format_vacancy(lines, c):
             vac = pd.get("vacancies")
             vac_str = f" — {vac}" if vac is not None else ""
             lines.append(f"   • {pname} ({cat}){vac_str}")
-    if v := _safe_str(c.get("qualification")):
-        lines.append(f"🎓 <b>{_labels('qualification')}:</b> {html.escape(v)}")
-    if v := _safe_str(c.get("age_limit")):
-        lines.append(f"🎂 <b>{_labels('age_limit')}:</b> {html.escape(v)}")
-    if v := _safe_str(c.get("pay_scale")):
-        lines.append(f"💰 <b>{_labels('pay_scale')}:</b> {html.escape(v)}")
-    if v := _safe_str(c.get("application_fee")):
-        lines.append(f"💳 <b>{_labels('application_fee')}:</b> {html.escape(v)}")
-    if v := _safe_str(c.get("last_date")):
-        lines.append(f"📅 <b>{_labels('last_date')}:</b> {html.escape(v)}")
-    link = _safe_str(c.get("apply_link"), 500)
-    if link:
-        lines.append(f'🌐 <a href="{html.escape(link, quote=True)}">{html.escape(_labels("apply_online"))}</a>')
+    _line(lines, "🎓", "qualification", _safe_str(c.get("qualification")))
+    _line(lines, "🎂", "age_limit", _safe_str(c.get("age_limit")))
+    _line(lines, "💰", "pay_scale", _safe_str(c.get("pay_scale")))
+    _line(lines, "💳", "application_fee", _safe_str(c.get("application_fee")))
+    _line(lines, "📅", "last_date", _safe_str(c.get("last_date")))
+    _link_line(lines, "🌐", "apply_online", _safe_str(c.get("apply_link"), 500))
 
 
 def _format_result(lines, c):
-    if v := _safe_str(c.get("result_for")):
-        lines.append(f"📝 <b>{_labels('result_for')}:</b> {html.escape(v)}")
-    if v := _safe_str(c.get("result_date")):
-        lines.append(f"📅 <b>{_labels('declared_on')}:</b> {html.escape(v)}")
-    link = _safe_str(c.get("result_link"), 500)
-    if link:
-        lines.append(f'📄 <a href="{html.escape(link, quote=True)}">{html.escape(_labels("check_result"))}</a>')
+    _line(lines, "📝", "result_for", _safe_str(c.get("result_for")))
+    _line(lines, "📝", "exam", _safe_str(c.get("exam_name")))
+    _line(lines, "📅", "session", _safe_str(c.get("session")))
+    _line(lines, "📚", "semester", _safe_str(c.get("semester")))
+    _line(lines, "📅", "declared_on", _safe_str(c.get("result_date")))
+    _link_line(lines, "📄", "check_result", _safe_str(c.get("result_link"), 500))
+    _line(lines, "🔄", "rechecking_last_date", _safe_str(c.get("rechecking_last_date")))
+    _link_line(lines, "🔗", "rechecking_link", _safe_str(c.get("rechecking_link"), 500))
 
 
 def _format_admit_card(lines, c):
-    if v := _safe_str(c.get("exam_name")):
-        lines.append(f"📝 <b>{_labels('exam')}:</b> {html.escape(v)}")
-    if v := _safe_str(c.get("exam_date")):
-        lines.append(f"📅 <b>{_labels('exam_date')}:</b> {html.escape(v)}")
-    link = _safe_str(c.get("admit_card_link"), 500)
-    if link:
-        lines.append(f'🎫 <a href="{html.escape(link, quote=True)}">{html.escape(_labels("download_admit_card"))}</a>')
+    _line(lines, "📝", "exam", _safe_str(c.get("exam_name")))
+    _line(lines, "📅", "session", _safe_str(c.get("session")))
+    _line(lines, "📚", "semester", _safe_str(c.get("semester")))
+    _line(lines, "📅", "exam_date", _safe_str(c.get("exam_date")))
+    _line(lines, "⬇️", "download_start_date", _safe_str(c.get("download_start_date")))
+    _line(lines, "📅", "download_last_date", _safe_str(c.get("download_last_date")))
+    _link_line(lines, "🎫", "download_admit_card", _safe_str(c.get("admit_card_link"), 500))
 
 
 def _format_answer_key(lines, c):
-    if v := _safe_str(c.get("exam_name")):
-        lines.append(f"📝 <b>{_labels('exam')}:</b> {html.escape(v)}")
-    link = _safe_str(c.get("answer_key_link"), 500)
-    if link:
-        lines.append(f'🔑 <a href="{html.escape(link, quote=True)}">{html.escape(_labels("view_answer_key"))}</a>')
-
-
-def _format_scholarship(lines, c):
-    if v := _safe_str(c.get("scholarship_amount")):
-        lines.append(f"💰 <b>{_labels('amount')}:</b> {html.escape(v)}")
-    if v := _safe_str(c.get("eligibility")):
-        lines.append(f"🎓 <b>{_labels('eligibility')}:</b> {html.escape(v)}")
-    if v := _safe_str(c.get("last_date")):
-        lines.append(f"📅 <b>{_labels('last_date')}:</b> {html.escape(v)}")
+    _line(lines, "📝", "exam", _safe_str(c.get("exam_name")))
+    _line(lines, "📅", "session", _safe_str(c.get("session")))
+    _link_line(lines, "🔑", "view_answer_key", _safe_str(c.get("answer_key_link"), 500))
+    _line(lines, "📅", "objection_start_date", _safe_str(c.get("objection_start_date")))
+    _line(lines, "📅", "objection_last_date", _safe_str(c.get("objection_last_date")))
+    _line(lines, "💳", "objection_fee", _safe_str(c.get("objection_fee")))
+    _link_line(lines, "🔗", "objection_link", _safe_str(c.get("objection_link"), 500))
 
 
 def _format_admission(lines, c):
-    if v := _safe_str(c.get("course_name")):
-        lines.append(f"🎓 <b>{_labels('course')}:</b> {html.escape(v)}")
-    if v := _safe_str(c.get("last_date")):
-        lines.append(f"📅 <b>{_labels('last_date')}:</b> {html.escape(v)}")
-    link = _safe_str(c.get("apply_link"), 500)
-    if link:
-        lines.append(f'🌐 <a href="{html.escape(link, quote=True)}">{html.escape(_labels("apply_online"))}</a>')
+    _line(lines, "🎓", "course", _safe_str(c.get("course_name")))
+    _line(lines, "🏛️", "university_name", _safe_str(c.get("university_name")))
+    _line(lines, "📅", "session", _safe_str(c.get("session")))
+    _line(lines, "✅", "eligibility", _safe_str(c.get("eligibility")))
+    _line(lines, "💳", "application_fee", _safe_str(c.get("application_fee")))
+    _line(lines, "📅", "last_date", _safe_str(c.get("last_date")))
+    _line(lines, "🎯", "counselling_date", _safe_str(c.get("counselling_date")))
+    _link_line(lines, "🌐", "apply_online", _safe_str(c.get("apply_link"), 500))
+
+
+def _format_counselling(lines, c):
+    _line(lines, "🎓", "course", _safe_str(c.get("course_name")))
+    _line(lines, "🔢", "round", _safe_str(c.get("round")))
+    _line(lines, "📅", "counselling_date", _safe_str(c.get("counselling_date")))
+    _line(lines, "⏰", "counselling_time", _safe_str(c.get("counselling_time")))
+    _line(lines, "📍", "venue", _safe_str(c.get("venue")))
+    _link_line(lines, "🌐", "apply_online", _safe_str(c.get("apply_link"), 500))
+
+
+def _format_scholarship(lines, c):
+    _line(lines, "🎯", "scheme_name", _safe_str(c.get("scheme_name")))
+    _line(lines, "💰", "amount", _safe_str(c.get("scholarship_amount")))
+    _line(lines, "👥", "applicable_category", _safe_str(c.get("applicable_category")))
+    _line(lines, "💵", "income_limit", _safe_str(c.get("income_limit")))
+    _line(lines, "🎓", "eligibility", _safe_str(c.get("eligibility")))
+    _line(lines, "📅", "last_date", _safe_str(c.get("last_date")))
+    _link_line(lines, "🌐", "apply_online", _safe_str(c.get("apply_link"), 500))
+
+
+def _format_exam_schedule(lines, c):
+    _line(lines, "📝", "exam", _safe_str(c.get("exam_name")))
+    _line(lines, "📅", "session", _safe_str(c.get("session")))
+    _line(lines, "📚", "semester", _safe_str(c.get("semester")))
+    _line(lines, "🎓", "course", _safe_str(c.get("course_name")))
+    _line(lines, "📅", "exam_start_date", _safe_str(c.get("exam_start_date")))
+    _line(lines, "📅", "exam_end_date", _safe_str(c.get("exam_end_date")))
+    _line(lines, "⏰", "exam_time", _safe_str(c.get("exam_time")))
+    _link_line(lines, "📄", "timetable_link", _safe_str(c.get("timetable_link"), 500))
+
+
+def _format_tender(lines, c):
+    _line(lines, "📋", "tender_no", _safe_str(c.get("tender_no")))
+    _line(lines, "📝", "work_description", _safe_str(c.get("work_description")))
+    _line(lines, "🏢", "issuing_authority", _safe_str(c.get("issuing_authority")))
+    _line(lines, "💰", "estimated_cost", _safe_str(c.get("estimated_cost")))
+    _line(lines, "💳", "emd_amount", _safe_str(c.get("emd_amount")))
+    _line(lines, "📄", "tender_fee", _safe_str(c.get("tender_fee")))
+    _line(lines, "📅", "submission_last_date", _safe_str(c.get("submission_last_date")))
+    _line(lines, "📅", "opening_date", _safe_str(c.get("opening_date")))
+    _line(lines, "🌐", "submission_mode", _safe_str(c.get("submission_mode")))
+    _link_line(lines, "🔗", "download_tender", _safe_str(c.get("apply_link"), 500))
+
+
+def _format_gazette(lines, c):
+    _line(lines, "📋", "gazette_no", _safe_str(c.get("gazette_no")))
+    _line(lines, "📰", "gazette_type", _safe_str(c.get("gazette_type")))
+    _line(lines, "📝", "subject", _safe_str(c.get("subject")))
+    _line(lines, "🏢", "issuing_authority", _safe_str(c.get("issuing_authority")))
+    _line(lines, "📅", "publication_date", _safe_str(c.get("publication_date")))
+    _link_line(lines, "🔗", "gazette_link", _safe_str(c.get("gazette_link"), 500))
+
+
+def _format_land_revenue(lines, c):
+    _line(lines, "📋", "notification_no", _safe_str(c.get("notification_no")))
+    _line(lines, "📝", "subject", _safe_str(c.get("subject")))
+    _line(lines, "🏞️", "land_location", _safe_str(c.get("land_location")))
+    _line(lines, "📐", "affected_area", _safe_str(c.get("affected_area")))
+    _line(lines, "🔖", "notification_type", _safe_str(c.get("notification_type")))
+    _line(lines, "🏢", "issuing_authority", _safe_str(c.get("issuing_authority")))
+    _line(lines, "📅", "effective_date", _safe_str(c.get("effective_date")))
+    _link_line(lines, "🔗", "order_link", _safe_str(c.get("order_link"), 500))
+
+
+def _format_press_release(lines, c):
+    _line(lines, "📝", "subject", _safe_str(c.get("subject")))
+    _line(lines, "🏢", "issuing_department", _safe_str(c.get("issuing_department")))
+    _line(lines, "📅", "release_date", _safe_str(c.get("release_date")))
+    _line(lines, "🔖", "reference_no", _safe_str(c.get("reference_no")))
+    _link_line(lines, "🔗", "release_link", _safe_str(c.get("release_link"), 500))
+
+
+def _format_announcement(lines, c):
+    _line(lines, "📝", "subject", _safe_str(c.get("subject")))
+    _line(lines, "🏢", "issuing_authority", _safe_str(c.get("issuing_authority")))
+    _line(lines, "🔖", "reference_no", _safe_str(c.get("reference_no")))
+    _line(lines, "📅", "effective_date", _safe_str(c.get("effective_date")))
+    _link_line(lines, "🌐", "apply_online", _safe_str(c.get("apply_link"), 500))
+
+
+def _format_publication(lines, c):
+    _line(lines, "📚", "publication_name", _safe_str(c.get("publication_name")))
+    _line(lines, "🔖", "publication_type", _safe_str(c.get("publication_type")))
+    _line(lines, "🏢", "publisher", _safe_str(c.get("publisher")))
+    _line(lines, "📅", "publication_date", _safe_str(c.get("publication_date")))
+    _link_line(lines, "🔗", "download_link", _safe_str(c.get("download_link"), 500))
+
+
+def _format_notice(lines, c):
+    _line(lines, "📝", "subject", _safe_str(c.get("subject")))
+    _line(lines, "🔖", "reference_no", _safe_str(c.get("reference_no")))
+    _line(lines, "🏢", "issuing_authority", _safe_str(c.get("issuing_authority")))
+    _line(lines, "📅", "effective_date", _safe_str(c.get("effective_date")))
+    _link_line(lines, "🔗", "order_link", _safe_str(c.get("order_link"), 500))
+
+
+_FORMATTERS = {
+    "vacancy": _format_vacancy,
+    "result": _format_result,
+    "admit_card": _format_admit_card,
+    "answer_key": _format_answer_key,
+    "admission": _format_admission,
+    "counselling": _format_counselling,
+    "scholarship": _format_scholarship,
+    "exam_schedule": _format_exam_schedule,
+    "tender": _format_tender,
+    "gazette": _format_gazette,
+    "land_revenue": _format_land_revenue,
+    "press_release": _format_press_release,
+    "announcement": _format_announcement,
+    "publication": _format_publication,
+    "notice": _format_notice,
+}
 
 
 def format_message(site, item, classification=None):
@@ -1348,12 +1563,9 @@ def format_message(site, item, classification=None):
         lines.append("")
 
     try:
-        if category == "vacancy": _format_vacancy(lines, classification)
-        elif category == "result": _format_result(lines, classification)
-        elif category == "admit_card": _format_admit_card(lines, classification)
-        elif category == "answer_key": _format_answer_key(lines, classification)
-        elif category == "scholarship": _format_scholarship(lines, classification)
-        elif category == "admission": _format_admission(lines, classification)
+        formatter = _FORMATTERS.get(category)
+        if formatter:
+            formatter(lines, classification)
     except Exception as exc:
         print(f"[WARN] Message formatting error: {exc}", file=sys.stderr)
 
@@ -1375,7 +1587,7 @@ def truncate_telegram(text, limit=TELEGRAM_SAFE_LIMIT):
 
 
 # ---------------------------------------------------------------------------
-# State pruning / stats
+# Prune / stats
 # ---------------------------------------------------------------------------
 
 def prune_state(state, retention_days):
@@ -1422,7 +1634,6 @@ def _fetch_pdfs_for_batch(batch, scan):
     ]
     if not targets:
         return
-
     timeout = scan["request_timeout_seconds"]
 
     def _fetch_one(record):
@@ -1446,7 +1657,7 @@ def _fetch_pdfs_for_batch(batch, scan):
                 record["pdf_extracted"] = True
 
 
-def _parse_upload_date(raw) -> Optional[datetime]:
+def _parse_upload_date(raw):
     if not raw:
         return None
     try:
@@ -1552,13 +1763,10 @@ def main():
                     state["items"][fuzzy_iid]["last_seen"] = utc_now()
                     continue
 
-                # Use upload_date (authoritative) for staleness check
                 upload_dt = _parse_upload_date(candidate.get("upload_date"))
                 if _is_stale_notice(
-                    candidate["title"],
-                    candidate.get("context", ""),
-                    candidate["url"],
-                    upload_date=upload_dt,
+                    candidate["title"], candidate.get("context", ""),
+                    candidate["url"], upload_date=upload_dt,
                 ):
                     state["items"][iid] = {
                         "site_id": sid, "site_name": site["name"],
@@ -1570,11 +1778,7 @@ def main():
                         "classification": None, "pdf_extracted": False,
                         "pdf_text": "", "pdf_attempts": 0, "telegram_attempts": 0,
                         "upload_date": candidate.get("upload_date"),
-                        "last_error": (
-                            f"Stale notice "
-                            f"(upload={candidate.get('upload_date')}, "
-                            f"limit={STALE_NOTICE_DAYS}d)"
-                        ),
+                        "last_error": f"Stale (limit={STALE_NOTICE_DAYS}d)",
                     }
                     site_items_list.append((iid, candidate["title"], candidate["url"]))
                     continue
@@ -1621,15 +1825,12 @@ def main():
     pending = pending[: scan["gemini_batch_size"] * scan["gemini_max_calls_per_run"]]
 
     batch_size = scan["gemini_batch_size"]
-
     for start in range(0, len(pending), batch_size):
         batch = pending[start : start + batch_size]
-
         try:
             _fetch_pdfs_for_batch(batch, scan)
         except Exception as exc:
             print(f"[WARN] PDF batch fetch failed: {exc}", file=sys.stderr)
-
         try:
             result = gemini_classify_with_fallback(
                 [record for _, record in batch], gemini_key, scan["request_timeout_seconds"],
@@ -1670,11 +1871,9 @@ def main():
             record["status"] = "permanent_error"
             record["last_error"] = "Configured site no longer exists"
             continue
-
         message = truncate_telegram(format_message(site, record, record.get("classification")))
         ok, permanent, detail = send_telegram(token, chat_id, message)
         record["telegram_attempts"] = int(record.get("telegram_attempts", 0)) + 1
-
         if ok:
             record["status"] = "sent"
             record["last_error"] = None
