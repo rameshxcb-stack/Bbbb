@@ -47,7 +47,7 @@ STALE_NOTICE_DAYS = int(os.getenv("STALE_NOTICE_DAYS", "30"))
 
 USER_AGENT = os.getenv(
     "MONITOR_USER_AGENT",
-    "Mozilla/5.0 (compatible; JharkhandNoticeMonitor/5.2)"
+    "Mozilla/5.0 (compatible; JharkhandNoticeMonitor/5.3)"
 )
 
 STRONG_KEYWORDS = [
@@ -163,33 +163,42 @@ def _is_empty_page_text(html_text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Full-date extraction
+# Full-date extraction (with Hindi month support)
 # ---------------------------------------------------------------------------
 
 _MONTH_NAMES = {
+    # English
     "january": 1, "jan": 1, "february": 2, "feb": 2,
     "march": 3, "mar": 3, "april": 4, "apr": 4,
     "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7,
     "august": 8, "aug": 8, "september": 9, "sep": 9, "sept": 9,
     "october": 10, "oct": 10, "november": 11, "nov": 11,
     "december": 12, "dec": 12,
+    # Hindi (Devanagari)
+    "जनवरी": 1, "फरवरी": 2, "मार्च": 3, "अप्रैल": 4,
+    "मई": 5, "जून": 6, "जुलाई": 7, "अगस्त": 8,
+    "सितंबर": 9, "सितम्बर": 9, "अक्टूबर": 10, "अक्तूबर": 10,
+    "नवंबर": 11, "नवम्बर": 11, "दिसंबर": 12, "दिसम्बर": 12,
 }
+
+# English month names for regex (Hindi months rarely appear in full-date pattern)
+_MONTH_REGEX = (
+    r"jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|"
+    r"january|february|march|april|june|july|august|"
+    r"september|october|november|december"
+)
 
 _FULL_DATE_PATTERNS = [
     re.compile(r"\b(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})\b"),
     re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b"),
     re.compile(
         r"\b(\d{1,2})(?:st|nd|rd|th)?[\s\-]+"
-        r"(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|"
-        r"january|february|march|april|june|july|august|"
-        r"september|october|november|december)"
+        r"(" + _MONTH_REGEX + r")"
         r"[\s\-,]+(\d{4})\b",
         re.I,
     ),
     re.compile(
-        r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|"
-        r"january|february|march|april|june|july|august|"
-        r"september|october|november|december)"
+        r"\b(" + _MONTH_REGEX + r")"
         r"[\s\-]+(\d{1,2})(?:st|nd|rd|th)?[\s\-,]+(\d{4})\b",
         re.I,
     ),
@@ -209,10 +218,14 @@ def _extract_full_dates(text: str) -> List[datetime]:
                 a, b, c = g
                 if a.isdigit() and len(a) == 4:
                     y, mo, d = int(a), int(b), int(c)
-                elif b.isalpha():
-                    d = int(a); mo = _MONTH_NAMES.get(b.lower(), 0); y = int(c)
-                elif a.isalpha():
-                    mo = _MONTH_NAMES.get(a.lower(), 0); d = int(b); y = int(c)
+                elif b.isalpha() or (b and not b.isdigit()):
+                    d = int(a)
+                    mo = _MONTH_NAMES.get(b.lower(), 0)
+                    y = int(c)
+                elif a and not a.isdigit():
+                    mo = _MONTH_NAMES.get(a.lower(), 0)
+                    d = int(b)
+                    y = int(c)
                 else:
                     d, mo, y = int(a), int(b), int(c)
                 if not (1 <= mo <= 12 and 1 <= d <= 31):
@@ -230,25 +243,20 @@ def _extract_full_dates(text: str) -> List[datetime]:
 # ---------------------------------------------------------------------------
 
 _UPLOAD_DATE_TEXT_PATTERNS = [
-    # "Published: 15/10/2026", "Posted on: 15-10-2026", "Uploaded: 15.10.2026"
     re.compile(
         r"(?:published|posted|uploaded|issued|dated)"
         r"\s*(?:on|at|:|\-)?\s*"
         r"(\d{1,2}[/\-.]\d{1,2}[/\-.]\d{4})",
         re.I,
     ),
-    # "Published: 15 October 2026"
     re.compile(
         r"(?:published|posted|uploaded|issued|dated)"
         r"\s*(?:on|at|:|\-)?\s*"
         r"(\d{1,2}(?:st|nd|rd|th)?\s+"
-        r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|"
-        r"january|february|march|april|june|july|august|"
-        r"september|october|november|december)"
+        r"(?:" + _MONTH_REGEX + r")"
         r"\s+\d{4})",
         re.I,
     ),
-    # Hindi: "दिनांक: 15/10/2026", "प्रकाशित: 15-10-2026", "जारी: 15.10.2026"
     re.compile(
         r"(?:दिनांक|प्रकाशित|जारी|अपलोड|अद्यतन)"
         r"\s*[:\-]?\s*"
@@ -258,19 +266,33 @@ _UPLOAD_DATE_TEXT_PATTERNS = [
 ]
 
 
-def _extract_upload_date(anchor_tag, soup) -> Optional[datetime]:
+def _extract_upload_date(anchor_tag) -> Optional[datetime]:
     """
     Extract publication/upload date near a link.
-    Priority: <time datetime> tag > text patterns near link.
+
+    Priority for search_root:
+      1. <tr>        (NIC table sites — date in sibling <td>)  ← CRITICAL
+      2. <li>        (list-based sites)
+      3. <article>   (WordPress-style sites)
+      4. <div>/<section>  (fallback — riskier)
+      5. anchor's parent (last resort)
+
     Returns timezone-aware datetime or None.
     """
     try:
-        parent = anchor_tag.find_parent(
-            ["li", "td", "tr", "article", "section", "div"]
+        # Prefer <tr> first — critical for NIC table-based sites
+        search_root = (
+            anchor_tag.find_parent("tr")
+            or anchor_tag.find_parent("li")
+            or anchor_tag.find_parent("article")
+            or anchor_tag.find_parent(["div", "section"])
+            or anchor_tag.parent
         )
-        search_root = parent if parent else anchor_tag
 
-        # 1. <time datetime="..."> tag
+        if not search_root:
+            return None
+
+        # 1. <time datetime="...">
         time_tag = search_root.find("time")
         if time_tag:
             raw = time_tag.get("datetime") or time_tag.get_text(strip=True)
@@ -287,7 +309,7 @@ def _extract_upload_date(anchor_tag, soup) -> Optional[datetime]:
                 if ds:
                     return ds[0]
 
-        # 2. Text-based patterns
+        # 2. Text patterns ("Published:", "दिनांक:", etc.)
         text = search_root.get_text(" ", strip=True)
         for pat in _UPLOAD_DATE_TEXT_PATTERNS:
             m = pat.search(text)
@@ -496,7 +518,7 @@ def get_config() -> Dict[str, Any]:
 
 def default_state() -> Dict[str, Any]:
     return {
-        "version": 10,
+        "version": 11,
         "initialized": False,
         "last_run": None,
         "items": {},
@@ -541,7 +563,7 @@ def load_state() -> Dict[str, Any]:
         record.setdefault("first_seen", utc_now())
         record.setdefault("last_seen", record["first_seen"])
 
-    state["version"] = 10
+    state["version"] = 11
     return state
 
 
@@ -692,7 +714,7 @@ def extract_candidates(html_text, page_url, site, scan):
         seen.add(href)
 
         # Extract upload date (authoritative if present)
-        upload_dt = _extract_upload_date(a, soup)
+        upload_dt = _extract_upload_date(a)
 
         out.append({
             "url": href,
