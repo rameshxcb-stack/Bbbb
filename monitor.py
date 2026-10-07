@@ -13,8 +13,10 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse, urlunparse
 
 import pdfplumber
+import pytesseract
 import requests
 from bs4 import BeautifulSoup
+from pdf2image import convert_from_bytes
 from rapidfuzz import fuzz
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -30,14 +32,23 @@ FALLBACK_MODELS = [
     "gemini-2.0-flash-lite",
 ]
 
-# FIX 4: 95 → 97 (avoid skipping "Recruitment 01/2026" vs "Recruitment 02/2026")
 FUZZY_DUPLICATE_THRESHOLD = 97
 
 MAX_PDF_BYTES = 5 * 1024 * 1024
 MAX_PDF_PAGES = 3
-MAX_PDF_TEXT_CHARS = 2500
+MAX_PDF_TEXT_CHARS = 3500
 MAX_PDF_ATTEMPTS = 3
 TELEGRAM_SAFE_LIMIT = 4000
+
+# Gemini output — raised for larger schemas
+GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "16384"))
+
+# OCR settings
+OCR_ENABLED = os.getenv("OCR_ENABLED", "true").strip().lower() == "true"
+OCR_DPI = int(os.getenv("OCR_DPI", "200"))
+OCR_LANG = os.getenv("OCR_LANG", "eng")          # "eng" default — Hindi quality poor
+OCR_MIN_TEXT_CHARS = int(os.getenv("OCR_MIN_TEXT_CHARS", "200"))
+OCR_MAX_WORKERS = int(os.getenv("OCR_MAX_WORKERS", "1"))   # sequential for CPU-bound
 
 NOTIFY_LANGUAGE = os.getenv("NOTIFY_LANGUAGE", "both").strip().lower()
 if NOTIFY_LANGUAGE not in {"both", "hi", "en"}:
@@ -47,7 +58,7 @@ STALE_NOTICE_DAYS = int(os.getenv("STALE_NOTICE_DAYS", "30"))
 
 USER_AGENT = os.getenv(
     "MONITOR_USER_AGENT",
-    "Mozilla/5.0 (compatible; JharkhandNoticeMonitor/5.6)"
+    "Mozilla/5.0 (compatible; JharkhandNoticeMonitor/6.1)"
 )
 
 STRONG_KEYWORDS = [
@@ -179,7 +190,6 @@ _MONTH_NAMES = {
     "नवंबर": 11, "नवम्बर": 11, "दिसंबर": 12, "दिसम्बर": 12,
 }
 
-# FIX 1: Hindi months added to regex
 _MONTH_REGEX = (
     r"jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|"
     r"january|february|march|april|june|july|august|"
@@ -379,7 +389,7 @@ def get_config():
         "max_items_per_site": 100,
         "max_discovery_pages_per_site": 5,
         "max_new_items_per_run": 30,
-        "gemini_batch_size": 3,
+        "gemini_batch_size": 2,
         "gemini_max_calls_per_run": 25,
         "retention_days": 90,
         "max_pending_attempts": 12,
@@ -439,7 +449,7 @@ def get_config():
 
 def default_state():
     return {
-        "version": 14,
+        "version": 16,
         "initialized": False,
         "last_run": None,
         "items": {},
@@ -477,11 +487,12 @@ def load_state():
         record.setdefault("pdf_extracted", False)
         record.setdefault("pdf_text", "")
         record.setdefault("pdf_attempts", 0)
+        record.setdefault("ocr_used", False)
         record.setdefault("telegram_attempts", 0)
         record.setdefault("upload_date", None)
         record.setdefault("first_seen", utc_now())
         record.setdefault("last_seen", record["first_seen"])
-    state["version"] = 14
+    state["version"] = 16
     return state
 
 
@@ -601,7 +612,6 @@ def extract_candidates(html_text, page_url, site, scan):
         if _is_generic_title(title):
             continue
 
-        # FIX 2: Prefer <tr> so date (in sibling <td>) is included in context
         parent = a.find_parent("tr")
         if parent is None:
             parent = a.find_parent(["li", "article", "section"])
@@ -737,37 +747,111 @@ def scan_site(site, scan):
 
 
 # ---------------------------------------------------------------------------
-# PDF
+# PDF extraction (text + tables + OCR)
 # ---------------------------------------------------------------------------
 
+def _extract_pdf_text_plumber(content):
+    parts = []
+    try:
+        with pdfplumber.open(io.BytesIO(content)) as pdf:
+            for page in pdf.pages[:MAX_PDF_PAGES]:
+                try:
+                    t = page.extract_text() or ""
+                    if t.strip():
+                        parts.append(t)
+                except Exception:
+                    pass
+                try:
+                    tables = page.extract_tables() or []
+                    for table in tables:
+                        for row in table:
+                            cells = [str(c).strip() for c in row if c]
+                            if cells:
+                                parts.append(" | ".join(cells))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return "\n".join(parts)
+
+
+def _extract_pdf_text_ocr(content):
+    parts = []
+    try:
+        images = convert_from_bytes(
+            content,
+            first_page=1,
+            last_page=MAX_PDF_PAGES,
+            dpi=OCR_DPI,
+        )
+        for img in images:
+            try:
+                txt = pytesseract.image_to_string(img, lang=OCR_LANG) or ""
+                if txt.strip():
+                    parts.append(txt)
+            except Exception as exc:
+                print(f"[WARN] OCR page failed: {exc}", file=sys.stderr)
+    except Exception as exc:
+        print(f"[WARN] OCR conversion failed: {exc}", file=sys.stderr)
+    return "\n".join(parts)
+
+
+def _text_looks_thin(text):
+    """
+    Return True if pdfplumber text is too thin to be useful:
+      - less than OCR_MIN_TEXT_CHARS characters, OR
+      - no digits (likely just watermark / headers), OR
+      - fewer than 3 newlines (likely 1-2 lines only)
+    """
+    stripped = (text or "").strip()
+    if len(stripped) < OCR_MIN_TEXT_CHARS:
+        return True
+    if not re.search(r"\d", stripped):
+        return True
+    if stripped.count("\n") < 3:
+        return True
+    return False
+
+
 def download_pdf_text(session, pdf_url, timeout=30):
+    """
+    Extract text from a PDF:
+      1. Try pdfplumber (text-based)
+      2. If text looks thin AND OCR enabled → run OCR
+      3. Return best of the two + flag whether OCR was used
+    """
     try:
         response = session.get(pdf_url, timeout=timeout)
         if response.status_code >= 400:
-            return ""
+            return "", False
         content_length = response.headers.get("content-length")
         if content_length:
             try:
                 if int(content_length) > MAX_PDF_BYTES:
-                    return ""
+                    return "", False
             except (TypeError, ValueError):
                 pass
         content = response.content
         if not content or len(content) > MAX_PDF_BYTES:
-            return ""
-        text_parts = []
-        with pdfplumber.open(io.BytesIO(content)) as pdf:
-            for page in pdf.pages[:MAX_PDF_PAGES]:
-                try:
-                    page_text = page.extract_text() or ""
-                except Exception:
-                    page_text = ""
-                if page_text:
-                    text_parts.append(page_text)
-        return clean_text("\n".join(text_parts), MAX_PDF_TEXT_CHARS)
+            return "", False
+
+        text = _extract_pdf_text_plumber(content)
+        ocr_used = False
+
+        # OCR fallback: only if plumber text is weak
+        if OCR_ENABLED and _text_looks_thin(text):
+            try:
+                ocr_text = _extract_pdf_text_ocr(content)
+                if ocr_text.strip() and len(ocr_text.strip()) > len(text.strip()):
+                    text = ocr_text
+                    ocr_used = True
+            except Exception as exc:
+                print(f"[WARN] OCR failed for {pdf_url}: {exc}", file=sys.stderr)
+
+        return clean_text(text, MAX_PDF_TEXT_CHARS), ocr_used
     except Exception as exc:
         print(f"[WARN] PDF extract failed for {pdf_url}: {exc}", file=sys.stderr)
-        return ""
+        return "", False
 
 
 # ---------------------------------------------------------------------------
@@ -817,6 +901,7 @@ def _build_prompt(prompt_items):
         "You classify and extract details from links on official "
         "Jharkhand district websites (nic.in). "
         "Return JSON only using the exact schema below.\n\n"
+
         "CRITICAL — set important=false for ALL of these:\n"
         "- Language selector links (titles like 'हिन्दी', 'English')\n"
         "- Category listing pages, archive pages, pagination pages\n"
@@ -826,7 +911,9 @@ def _build_prompt(prompt_items):
         "- Generic descriptions like 'listing page', 'category page'\n"
         "- Birth and death figures, COVID-19 updates, cause lists, "
         "tour programs, holiday lists, generic events\n\n"
+
         "Set important=true ONLY for genuine, specific notices.\n\n"
+
         "For EACH item determine:\n"
         "1. important (true/false)\n"
         "2. category — one of: 'vacancy', 'result', 'admit_card', 'answer_key', "
@@ -834,96 +921,213 @@ def _build_prompt(prompt_items):
         "'tender', 'gazette', 'land_revenue', 'press_release', "
         "'announcement', 'publication', 'notice', 'other'\n"
         "3. summary — 1-line summary (<= 150 chars)\n\n"
-        "IMPORTANT: If 'pdf_text' is provided, treat it as PRIMARY source.\n\n"
+
+        "IMPORTANT: If 'pdf_text' is provided, treat it as PRIMARY source. "
+        "The text may come from OCR and could have minor errors — extract "
+        "values even if a few characters look odd, but do NOT invent data.\n\n"
+
+        "── UNIVERSAL FIELDS (extract for ALL categories if present) ──\n"
+        "reference_number, issuing_authority, issuing_date, "
+        "contact_person, contact_number, email, helpline_number, "
+        "official_address, important_instructions\n\n"
 
         "── CATEGORY-SPECIFIC EXTRACTION ──\n\n"
 
         "VACANCY: total_posts (int), post_details (array of "
-        "{post_name, category (UR/OBC/SC/ST/EWS), vacancies}), qualification, "
-        "age_limit, pay_scale, application_fee, last_date, apply_link\n\n"
+        "{post_name, category (UR/OBC/SC/ST/EWS), vacancies}), "
+        "qualification, age_limit, age_relaxation, pay_scale, salary_type, "
+        "application_fee, application_start_date, last_date, apply_link, "
+        "advertisement_no, how_to_apply, documents_required, "
+        "selection_process, experience_required, posting_location, "
+        "reservation_details, bond_details, interview_date, "
+        "interview_time, venue, reporting_time, engagement_type\n\n"
 
         "RESULT: result_for, exam_name, session, semester, result_date, "
-        "result_link, rechecking_last_date, rechecking_link\n\n"
+        "result_link, result_type, merit_list_link, cutoff_marks, "
+        "total_selected, next_stage, next_stage_date, roll_no_required, "
+        "rechecking_last_date, rechecking_link, rechecking_fee, rechecking_mode\n\n"
 
-        "ADMIT_CARD: exam_name, session, semester, exam_date, "
-        "download_start_date, download_last_date, roll_no_required, admit_card_link\n\n"
+        "ADMIT_CARD: exam_name, session, semester, exam_date, exam_time, "
+        "exam_duration, exam_pattern, exam_center, reporting_time, "
+        "download_start_date, download_last_date, roll_no_required, "
+        "admit_card_link, instructions, helpline_number, download_mode\n\n"
 
-        "ANSWER_KEY: exam_name, session, objection_start_date, "
-        "objection_last_date, objection_fee, answer_key_link, objection_link\n\n"
+        "ANSWER_KEY: exam_name, session, exam_date, total_questions, "
+        "answer_key_link, objection_start_date, objection_last_date, "
+        "objection_fee, per_question_fee, objection_mode, objection_address, "
+        "payment_mode, answer_key_type\n\n"
 
-        "ADMISSION: course_name, session, university_name, eligibility, "
-        "application_fee, last_date, counselling_date, apply_link\n\n"
+        "ADMISSION: course_name, course_duration, session, university_name, "
+        "eligibility, eligibility_marks, age_criteria, application_fee, "
+        "fee_structure, apply_start_date, last_date, counselling_date, "
+        "apply_link, admission_mode, total_seats, entrance_exam_name, "
+        "hostel_available, documents_required, prospectus_link\n\n"
 
-        "COUNSELLING: course_name, round, counselling_date, "
-        "counselling_time, venue, apply_link\n\n"
+        "COUNSELLING: course_name, round, counselling_date, counselling_time, "
+        "venue, apply_link, seat_matrix, registration_fee, "
+        "choice_filling_dates, required_documents, reporting_time, "
+        "counselling_mode, next_round_date\n\n"
 
-        "SCHOLARSHIP: scheme_name, scholarship_amount, eligibility, "
-        "applicable_category, income_limit, last_date, apply_link\n\n"
+        "SCHOLARSHIP: scheme_name, scholarship_amount, scholarship_duration, "
+        "eligibility, applicable_category, income_limit, last_date, "
+        "apply_link, apply_mode, portal_name, disbursement_mode, "
+        "renewal_criteria, documents_required, income_certificate_required, "
+        "caste_certificate_required, selection_criteria, helpline\n\n"
 
         "EXAM_SCHEDULE: exam_name, session, semester, course, "
-        "exam_start_date, exam_end_date, exam_time, timetable_link\n\n"
+        "exam_start_date, exam_end_date, exam_time, exam_center, "
+        "timetable_link, subject_list, paper_code, practical_dates, "
+        "viva_dates, reporting_time, instructions\n\n"
 
-        "TENDER: tender_no, work_description, issuing_authority, "
-        "estimated_cost, emd_amount, tender_fee, submission_last_date, "
-        "opening_date, submission_mode, apply_link\n\n"
+        "TENDER: tender_no, tender_type, work_description, issuing_authority, "
+        "estimated_cost, emd_amount, emd_mode, tender_fee, tender_fee_mode, "
+        "submission_last_date, opening_date, pre_bid_meeting_date, "
+        "pre_bid_meeting_venue, submission_mode, apply_link, "
+        "tender_document_link, bid_validity, completion_period, "
+        "payment_terms, eligibility_criteria\n\n"
 
-        "GAZETTE: gazette_no, gazette_type (E-Gazette/Gazetteer/Official), "
-        "subject, issuing_authority, publication_date, gazette_link\n\n"
+        "GAZETTE: gazette_no, gazette_type, subject, issuing_authority, "
+        "publication_date, gazette_link, effective_date, gazette_content\n\n"
 
-        "LAND_REVENUE: notification_no, subject, "
-        "land_location (village/plot), affected_area, "
-        "notification_type (Acquisition/Revenue/Transfer), "
-        "issuing_authority, effective_date, order_link\n\n"
+        "LAND_REVENUE: notification_no, subject, land_location, affected_area, "
+        "plot_numbers, khasra_no, thana_no, district, tehsil, village, "
+        "notification_type, issuing_authority, effective_date, order_link, "
+        "compensation_details, objections_last_date, objections_address, land_type\n\n"
 
         "PRESS_RELEASE: subject, issuing_department, release_date, "
-        "reference_no, release_link\n\n"
+        "reference_no, release_link, full_content, category\n\n"
 
         "ANNOUNCEMENT: subject, issuing_authority, reference_no, "
-        "effective_date, apply_link\n\n"
+        "effective_date, apply_link, announcement_type, target_audience, "
+        "action_required, action_deadline\n\n"
 
-        "PUBLICATION: publication_name, publication_type, "
-        "publisher, publication_date, download_link\n\n"
+        "PUBLICATION: publication_name, publication_type, publisher, "
+        "publication_date, download_link, author, pages, language, "
+        "edition, isbn, price\n\n"
 
-        "NOTICE: subject, reference_no, issuing_authority, "
-        "effective_date, order_link\n\n"
+        "NOTICE: subject, reference_no, issuing_authority, effective_date, "
+        "order_link, notice_type, applicable_to, action_required, "
+        "action_deadline, supersedes\n\n"
+
+        "── EXTRA DETAILS (ALWAYS EXTRACT) ──\n"
+        "For EVERY item, also extract ALL other fields that appear in the "
+        "notice but are not covered above, into 'extra_details' as an array "
+        "of {\"label\": \"...\", \"value\": \"...\"}. "
+        "Include every numbered item, bullet point, table row, or "
+        "field-value pair you find. Extract the EXACT text as written. "
+        "Limit to the 10 most important extra fields per item. "
+        "Set 'extra_details_present' to true if the notice contains a "
+        "table or numbered list of fields.\n\n"
 
         "Do NOT invent facts. Use null when unsure.\n\n"
 
         "Schema:\n"
         '{"items":[{'
         '"id":"0","important":true,"category":"vacancy","summary":"...",'
+        '"reference_number":null,"issuing_authority":null,"issuing_date":null,'
+        '"contact_person":null,"contact_number":null,"email":null,'
+        '"helpline_number":null,"official_address":null,"important_instructions":null,'
         '"total_posts":null,"post_details":[],"qualification":null,'
-        '"age_limit":null,"pay_scale":null,"application_fee":null,'
-        '"last_date":null,"apply_link":null,'
+        '"age_limit":null,"age_relaxation":null,"pay_scale":null,"salary_type":null,'
+        '"application_fee":null,"application_start_date":null,"last_date":null,'
+        '"apply_link":null,"advertisement_no":null,"how_to_apply":null,'
+        '"documents_required":null,"selection_process":null,'
+        '"experience_required":null,"posting_location":null,'
+        '"reservation_details":null,"bond_details":null,'
+        '"interview_date":null,"interview_time":null,"venue":null,'
+        '"reporting_time":null,"engagement_type":null,'
         '"result_for":null,"exam_name":null,"session":null,"semester":null,'
-        '"result_date":null,"result_link":null,'
+        '"result_date":null,"result_link":null,"result_type":null,'
+        '"merit_list_link":null,"cutoff_marks":null,"total_selected":null,'
+        '"next_stage":null,"next_stage_date":null,"roll_no_required":null,'
         '"rechecking_last_date":null,"rechecking_link":null,'
-        '"exam_date":null,"download_start_date":null,"download_last_date":null,'
-        '"roll_no_required":null,"admit_card_link":null,'
+        '"rechecking_fee":null,"rechecking_mode":null,'
+        '"exam_date":null,"exam_time":null,"exam_duration":null,'
+        '"exam_pattern":null,"exam_center":null,'
+        '"download_start_date":null,"download_last_date":null,'
+        '"admit_card_link":null,"instructions":null,"download_mode":null,'
+        '"total_questions":null,"answer_key_link":null,'
         '"objection_start_date":null,"objection_last_date":null,'
-        '"objection_fee":null,"answer_key_link":null,"objection_link":null,'
-        '"course_name":null,"university_name":null,'
-        '"counselling_date":null,"counselling_time":null,"venue":null,'
-        '"round":null,'
-        '"scheme_name":null,"scholarship_amount":null,"eligibility":null,'
-        '"applicable_category":null,"income_limit":null,'
-        '"exam_start_date":null,"exam_end_date":null,"exam_time":null,'
-        '"timetable_link":null,'
-        '"tender_no":null,"work_description":null,"issuing_authority":null,'
-        '"estimated_cost":null,"emd_amount":null,"tender_fee":null,'
-        '"submission_last_date":null,"opening_date":null,"submission_mode":null,'
+        '"objection_fee":null,"per_question_fee":null,"objection_mode":null,'
+        '"objection_address":null,"payment_mode":null,"answer_key_type":null,'
+        '"course_name":null,"course_duration":null,"university_name":null,'
+        '"eligibility":null,"eligibility_marks":null,"age_criteria":null,'
+        '"fee_structure":null,"apply_start_date":null,"counselling_date":null,'
+        '"admission_mode":null,"total_seats":null,"entrance_exam_name":null,'
+        '"hostel_available":null,"prospectus_link":null,'
+        '"round":null,"counselling_time":null,"seat_matrix":null,'
+        '"registration_fee":null,"choice_filling_dates":null,'
+        '"required_documents":null,"counselling_mode":null,"next_round_date":null,'
+        '"scheme_name":null,"scholarship_amount":null,"scholarship_duration":null,'
+        '"applicable_category":null,"income_limit":null,"apply_mode":null,'
+        '"portal_name":null,"disbursement_mode":null,"renewal_criteria":null,'
+        '"income_certificate_required":null,"caste_certificate_required":null,'
+        '"selection_criteria":null,"helpline":null,'
+        '"exam_start_date":null,"exam_end_date":null,"timetable_link":null,'
+        '"subject_list":null,"paper_code":null,"practical_dates":null,'
+        '"viva_dates":null,'
+        '"tender_no":null,"tender_type":null,"work_description":null,'
+        '"estimated_cost":null,"emd_amount":null,"emd_mode":null,'
+        '"tender_fee":null,"tender_fee_mode":null,'
+        '"submission_last_date":null,"opening_date":null,'
+        '"pre_bid_meeting_date":null,"pre_bid_meeting_venue":null,'
+        '"submission_mode":null,"tender_document_link":null,'
+        '"bid_validity":null,"completion_period":null,'
+        '"payment_terms":null,"eligibility_criteria":null,'
         '"gazette_no":null,"gazette_type":null,"publication_date":null,'
-        '"gazette_link":null,'
+        '"gazette_link":null,"gazette_content":null,'
         '"notification_no":null,"land_location":null,"affected_area":null,'
+        '"plot_numbers":null,"khasra_no":null,"thana_no":null,'
+        '"district":null,"tehsil":null,"village":null,'
         '"notification_type":null,"effective_date":null,"order_link":null,'
-        '"issuing_department":null,"release_date":null,"reference_no":null,'
-        '"release_link":null,'
+        '"compensation_details":null,"objections_last_date":null,'
+        '"objections_address":null,"land_type":null,'
+        '"issuing_department":null,"release_date":null,'
+        '"release_link":null,"full_content":null,'
+        '"announcement_type":null,"target_audience":null,'
+        '"action_required":null,"action_deadline":null,'
         '"publication_name":null,"publication_type":null,"publisher":null,'
-        '"download_link":null,'
-        '"subject":null'
+        '"download_link":null,"author":null,"pages":null,'
+        '"language":null,"edition":null,"isbn":null,"price":null,'
+        '"subject":null,"notice_type":null,"applicable_to":null,"supersedes":null,'
+        '"extra_details":[],"extra_details_present":false'
         '}]}\n\n'
         + json.dumps(prompt_items, ensure_ascii=False)
     )
+
+
+def _normalize_label(label):
+    """Strip punctuation (colons, dots) and lowercase for comparison."""
+    return re.sub(r"[^\w\s]", "", (label or "").lower()).strip()
+
+
+def _clean_extra_details(raw):
+    if not isinstance(raw, list):
+        return []
+    out = []
+    seen_labels = set()
+    skip_labels = {
+        "qualification", "age", "age limit", "age_limit",
+        "no of post", "no of posts", "number of post", "total post",
+        "total posts", "honorarium", "salary", "pay scale", "pay_scale",
+        "application fee", "application_fee", "last date", "last_date",
+        "start date", "end date", "publish date", "published date",
+    }
+    for item in raw[:15]:
+        if not isinstance(item, dict):
+            continue
+        label = clean_text(str(item.get("label", "")), 100)
+        value = clean_text(str(item.get("value", "")), 300)
+        if not label or not value:
+            continue
+        if _normalize_label(label) in skip_labels:
+            continue
+        key = _normalize_label(label)
+        if key in seen_labels:
+            continue
+        seen_labels.add(key)
+        out.append({"label": label, "value": value})
+    return out
 
 
 def _parse_gemini_response(text, item_count):
@@ -966,75 +1170,198 @@ def _parse_gemini_response(text, item_count):
             "important": bool(row.get("important", False)),
             "category": clean_text(str(row.get("category", "notice")), 40) or "notice",
             "summary": clean_text(str(row.get("summary", "")), 200),
+            # Universal
+            "reference_number": _str(row, "reference_number", 100),
+            "issuing_authority": _str(row, "issuing_authority", 200),
+            "issuing_date": _str(row, "issuing_date", 80),
+            "contact_person": _str(row, "contact_person", 120),
+            "contact_number": _str(row, "contact_number", 100),
+            "email": _str(row, "email", 150),
+            "helpline_number": _str(row, "helpline_number", 100),
+            "official_address": _str(row, "official_address", 300),
+            "important_instructions": _str(row, "important_instructions", 400),
+            # Vacancy
             "total_posts": row.get("total_posts"),
             "post_details": clean_posts,
-            "qualification": _str(row, "qualification", 200),
+            "qualification": _str(row, "qualification", 250),
             "age_limit": _str(row, "age_limit", 100),
-            "pay_scale": _str(row, "pay_scale", 150),
-            "application_fee": _str(row, "application_fee", 200),
+            "age_relaxation": _str(row, "age_relaxation", 150),
+            "pay_scale": _str(row, "pay_scale", 200),
+            "salary_type": _str(row, "salary_type", 80),
+            "application_fee": _str(row, "application_fee", 250),
+            "application_start_date": _str(row, "application_start_date", 80),
             "last_date": _str(row, "last_date", 80),
             "apply_link": _str(row, "apply_link", 500),
+            "advertisement_no": _str(row, "advertisement_no", 100),
+            "how_to_apply": _str(row, "how_to_apply", 200),
+            "documents_required": _str(row, "documents_required", 400),
+            "selection_process": _str(row, "selection_process", 300),
+            "experience_required": _str(row, "experience_required", 200),
+            "posting_location": _str(row, "posting_location", 200),
+            "reservation_details": _str(row, "reservation_details", 250),
+            "bond_details": _str(row, "bond_details", 200),
+            "interview_date": _str(row, "interview_date", 80),
+            "interview_time": _str(row, "interview_time", 60),
+            "venue": _str(row, "venue", 250),
+            "reporting_time": _str(row, "reporting_time", 60),
+            "engagement_type": _str(row, "engagement_type", 100),
+            # Result
             "result_for": _str(row, "result_for", 200),
             "exam_name": _str(row, "exam_name", 200),
             "session": _str(row, "session", 80),
             "semester": _str(row, "semester", 60),
             "result_date": _str(row, "result_date", 80),
             "result_link": _str(row, "result_link", 500),
+            "result_type": _str(row, "result_type", 80),
+            "merit_list_link": _str(row, "merit_list_link", 500),
+            "cutoff_marks": _str(row, "cutoff_marks", 150),
+            "total_selected": _str(row, "total_selected", 60),
+            "next_stage": _str(row, "next_stage", 200),
+            "next_stage_date": _str(row, "next_stage_date", 80),
+            "roll_no_required": row.get("roll_no_required"),
             "rechecking_last_date": _str(row, "rechecking_last_date", 80),
             "rechecking_link": _str(row, "rechecking_link", 500),
+            "rechecking_fee": _str(row, "rechecking_fee", 100),
+            "rechecking_mode": _str(row, "rechecking_mode", 80),
+            # Admit card
             "exam_date": _str(row, "exam_date", 80),
+            "exam_time": _str(row, "exam_time", 60),
+            "exam_duration": _str(row, "exam_duration", 60),
+            "exam_pattern": _str(row, "exam_pattern", 200),
+            "exam_center": _str(row, "exam_center", 250),
             "download_start_date": _str(row, "download_start_date", 80),
             "download_last_date": _str(row, "download_last_date", 80),
-            "roll_no_required": row.get("roll_no_required"),
             "admit_card_link": _str(row, "admit_card_link", 500),
+            "instructions": _str(row, "instructions", 400),
+            "download_mode": _str(row, "download_mode", 80),
+            # Answer key
+            "total_questions": _str(row, "total_questions", 60),
+            "answer_key_link": _str(row, "answer_key_link", 500),
             "objection_start_date": _str(row, "objection_start_date", 80),
             "objection_last_date": _str(row, "objection_last_date", 80),
             "objection_fee": _str(row, "objection_fee", 100),
-            "answer_key_link": _str(row, "answer_key_link", 500),
-            "objection_link": _str(row, "objection_link", 500),
+            "per_question_fee": _str(row, "per_question_fee", 100),
+            "objection_mode": _str(row, "objection_mode", 80),
+            "objection_address": _str(row, "objection_address", 250),
+            "payment_mode": _str(row, "payment_mode", 100),
+            "answer_key_type": _str(row, "answer_key_type", 80),
+            # Admission
             "course_name": _str(row, "course_name", 200),
+            "course_duration": _str(row, "course_duration", 80),
             "university_name": _str(row, "university_name", 200),
-            "counselling_date": _str(row, "counselling_date", 80),
-            "counselling_time": _str(row, "counselling_time", 60),
-            "venue": _str(row, "venue", 200),
-            "round": _str(row, "round", 60),
-            "scheme_name": _str(row, "scheme_name", 200),
-            "scholarship_amount": _str(row, "scholarship_amount", 100),
             "eligibility": _str(row, "eligibility", 250),
-            "applicable_category": _str(row, "applicable_category", 100),
+            "eligibility_marks": _str(row, "eligibility_marks", 100),
+            "age_criteria": _str(row, "age_criteria", 100),
+            "fee_structure": _str(row, "fee_structure", 200),
+            "apply_start_date": _str(row, "apply_start_date", 80),
+            "counselling_date": _str(row, "counselling_date", 80),
+            "admission_mode": _str(row, "admission_mode", 100),
+            "total_seats": _str(row, "total_seats", 60),
+            "entrance_exam_name": _str(row, "entrance_exam_name", 200),
+            "hostel_available": _str(row, "hostel_available", 60),
+            "prospectus_link": _str(row, "prospectus_link", 500),
+            # Counselling
+            "round": _str(row, "round", 60),
+            "counselling_time": _str(row, "counselling_time", 60),
+            "seat_matrix": _str(row, "seat_matrix", 200),
+            "registration_fee": _str(row, "registration_fee", 100),
+            "choice_filling_dates": _str(row, "choice_filling_dates", 100),
+            "required_documents": _str(row, "required_documents", 400),
+            "counselling_mode": _str(row, "counselling_mode", 80),
+            "next_round_date": _str(row, "next_round_date", 80),
+            # Scholarship
+            "scheme_name": _str(row, "scheme_name", 200),
+            "scholarship_amount": _str(row, "scholarship_amount", 150),
+            "scholarship_duration": _str(row, "scholarship_duration", 100),
+            "applicable_category": _str(row, "applicable_category", 150),
             "income_limit": _str(row, "income_limit", 100),
+            "apply_mode": _str(row, "apply_mode", 100),
+            "portal_name": _str(row, "portal_name", 150),
+            "disbursement_mode": _str(row, "disbursement_mode", 100),
+            "renewal_criteria": _str(row, "renewal_criteria", 250),
+            "income_certificate_required": _str(row, "income_certificate_required", 40),
+            "caste_certificate_required": _str(row, "caste_certificate_required", 40),
+            "selection_criteria": _str(row, "selection_criteria", 250),
+            "helpline": _str(row, "helpline", 100),
+            # Exam schedule
             "exam_start_date": _str(row, "exam_start_date", 80),
             "exam_end_date": _str(row, "exam_end_date", 80),
-            "exam_time": _str(row, "exam_time", 60),
             "timetable_link": _str(row, "timetable_link", 500),
+            "subject_list": _str(row, "subject_list", 400),
+            "paper_code": _str(row, "paper_code", 200),
+            "practical_dates": _str(row, "practical_dates", 150),
+            "viva_dates": _str(row, "viva_dates", 150),
+            # Tender
             "tender_no": _str(row, "tender_no", 100),
+            "tender_type": _str(row, "tender_type", 100),
             "work_description": _str(row, "work_description", 300),
-            "issuing_authority": _str(row, "issuing_authority", 200),
             "estimated_cost": _str(row, "estimated_cost", 100),
             "emd_amount": _str(row, "emd_amount", 100),
+            "emd_mode": _str(row, "emd_mode", 100),
             "tender_fee": _str(row, "tender_fee", 100),
+            "tender_fee_mode": _str(row, "tender_fee_mode", 100),
             "submission_last_date": _str(row, "submission_last_date", 80),
             "opening_date": _str(row, "opening_date", 80),
-            "submission_mode": _str(row, "submission_mode", 60),
+            "pre_bid_meeting_date": _str(row, "pre_bid_meeting_date", 80),
+            "pre_bid_meeting_venue": _str(row, "pre_bid_meeting_venue", 200),
+            "submission_mode": _str(row, "submission_mode", 80),
+            "tender_document_link": _str(row, "tender_document_link", 500),
+            "bid_validity": _str(row, "bid_validity", 80),
+            "completion_period": _str(row, "completion_period", 100),
+            "payment_terms": _str(row, "payment_terms", 250),
+            "eligibility_criteria": _str(row, "eligibility_criteria", 300),
+            # Gazette
             "gazette_no": _str(row, "gazette_no", 100),
             "gazette_type": _str(row, "gazette_type", 100),
             "publication_date": _str(row, "publication_date", 80),
             "gazette_link": _str(row, "gazette_link", 500),
+            "gazette_content": _str(row, "gazette_content", 400),
+            # Land revenue
             "notification_no": _str(row, "notification_no", 100),
             "land_location": _str(row, "land_location", 250),
             "affected_area": _str(row, "affected_area", 100),
+            "plot_numbers": _str(row, "plot_numbers", 200),
+            "khasra_no": _str(row, "khasra_no", 100),
+            "thana_no": _str(row, "thana_no", 80),
+            "district": _str(row, "district", 100),
+            "tehsil": _str(row, "tehsil", 100),
+            "village": _str(row, "village", 150),
             "notification_type": _str(row, "notification_type", 100),
             "effective_date": _str(row, "effective_date", 80),
             "order_link": _str(row, "order_link", 500),
+            "compensation_details": _str(row, "compensation_details", 250),
+            "objections_last_date": _str(row, "objections_last_date", 80),
+            "objections_address": _str(row, "objections_address", 250),
+            "land_type": _str(row, "land_type", 100),
+            # Press release
             "issuing_department": _str(row, "issuing_department", 200),
             "release_date": _str(row, "release_date", 80),
-            "reference_no": _str(row, "reference_no", 100),
             "release_link": _str(row, "release_link", 500),
+            "full_content": _str(row, "full_content", 500),
+            # Announcement
+            "announcement_type": _str(row, "announcement_type", 100),
+            "target_audience": _str(row, "target_audience", 200),
+            "action_required": _str(row, "action_required", 250),
+            "action_deadline": _str(row, "action_deadline", 80),
+            # Publication
             "publication_name": _str(row, "publication_name", 200),
             "publication_type": _str(row, "publication_type", 100),
             "publisher": _str(row, "publisher", 200),
             "download_link": _str(row, "download_link", 500),
+            "author": _str(row, "author", 150),
+            "pages": _str(row, "pages", 40),
+            "language": _str(row, "language", 60),
+            "edition": _str(row, "edition", 60),
+            "isbn": _str(row, "isbn", 60),
+            "price": _str(row, "price", 60),
+            # Notice
             "subject": _str(row, "subject", 200),
+            "notice_type": _str(row, "notice_type", 100),
+            "applicable_to": _str(row, "applicable_to", 200),
+            "supersedes": _str(row, "supersedes", 200),
+            # Extra details
+            "extra_details": _clean_extra_details(row.get("extra_details")),
+            "extra_details_present": bool(row.get("extra_details_present", False)),
         }
     if not result:
         raise RuntimeError("Gemini returned no usable classifications")
@@ -1080,7 +1407,7 @@ def gemini_classify(items, api_key, model, timeout):
             "title": item["title"],
             "url": item["url"],
             "context": item.get("context", "")[:500],
-            "pdf_text": item.get("pdf_text", "")[:2000],
+            "pdf_text": item.get("pdf_text", "")[:3000],
         }
         for i, item in enumerate(items)
     ]
@@ -1090,7 +1417,7 @@ def gemini_classify(items, api_key, model, timeout):
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
             "responseMimeType": "application/json",
-            "maxOutputTokens": 8192,
+            "maxOutputTokens": GEMINI_MAX_OUTPUT_TOKENS,
             "temperature": 0.1,
         },
     }
@@ -1216,86 +1543,210 @@ def _safe_str(value, limit=300):
 
 
 _LABELS_HI = {
+    "reference_number": "संदर्भ संख्या", "issuing_authority": "जारीकर्ता विभाग",
+    "issuing_date": "जारी तारीख़", "contact_person": "संपर्क व्यक्ति",
+    "contact_number": "संपर्क नंबर", "email": "ईमेल",
+    "helpline_number": "हेल्पलाइन नंबर", "official_address": "कार्यालय पता",
+    "important_instructions": "ज़रूरी निर्देश",
     "total_posts": "कुल पद", "post_breakdown": "पद की जानकारी",
     "qualification": "योग्यता", "age_limit": "उम्र सीमा",
-    "pay_scale": "वेतन", "application_fee": "फ़ीस / चार्जेस",
+    "age_relaxation": "उम्र में छूट", "pay_scale": "वेतन",
+    "salary_type": "वेतन प्रकार", "application_fee": "फ़ीस / चार्जेस",
+    "application_start_date": "आवेदन शुरू",
     "last_date": "आख़िरी तारीख़", "apply_online": "ऑनलाइन अप्लाई करें",
+    "advertisement_no": "विज्ञापन संख्या", "how_to_apply": "कैसे अप्लाई करें",
+    "documents_required": "ज़रूरी दस्तावेज़",
+    "selection_process": "चयन प्रक्रिया",
+    "experience_required": "अनुभव ज़रूरी",
+    "posting_location": "पोस्टिंग स्थान",
+    "reservation_details": "आरक्षण विवरण",
+    "bond_details": "बॉन्ड विवरण",
+    "interview_date": "इंटरव्यू की तारीख़", "interview_time": "इंटरव्यू का समय",
+    "venue": "स्थान", "reporting_time": "रिपोर्टिंग समय",
+    "engagement_type": "नियुक्ति प्रकार",
     "result_for": "रिजल्ट किसका है", "declared_on": "रिजल्ट की तारीख़",
     "check_result": "रिजल्ट देखें", "session": "सत्र",
-    "semester": "सेमेस्टर",
-    "rechecking_last_date": "रीचेकिंग आख़िरी तारीख़", "rechecking_link": "रीचेकिंग लिंक",
+    "semester": "सेमेस्टर", "result_type": "रिजल्ट प्रकार",
+    "merit_list_link": "मेरिट लिस्ट देखें", "cutoff_marks": "कटऑफ़ मार्क्स",
+    "total_selected": "कुल चयनित", "next_stage": "अगला स्टेज",
+    "next_stage_date": "अगले स्टेज की तारीख़",
+    "rechecking_last_date": "रीचेकिंग आख़िरी", "rechecking_link": "रीचेकिंग लिंक",
+    "rechecking_fee": "रीचेकिंग शुल्क", "rechecking_mode": "रीचेकिंग मोड",
     "exam": "एग्ज़ाम", "exam_date": "एग्ज़ाम की तारीख़",
+    "exam_time": "एग्ज़ाम का समय", "exam_duration": "एग्ज़ाम की अवधि",
+    "exam_pattern": "एग्ज़ाम पैटर्न", "exam_center": "एग्ज़ाम सेंटर",
     "download_admit_card": "एडमिट कार्ड डाउनलोड करें",
     "download_start_date": "डाउनलोड शुरू", "download_last_date": "डाउनलोड आख़िरी",
-    "view_answer_key": "आंसर की देखें",
+    "instructions": "निर्देश", "download_mode": "डाउनलोड मोड",
+    "view_answer_key": "आंसर की देखें", "total_questions": "कुल प्रश्न",
     "objection_start_date": "आपत्ति शुरू", "objection_last_date": "आपत्ति आख़िरी",
-    "objection_fee": "आपत्ति शुल्क", "objection_link": "आपत्ति दर्ज करें",
-    "course": "कोर्स", "university_name": "यूनिवर्सिटी",
+    "objection_fee": "आपत्ति शुल्क", "per_question_fee": "प्रति प्रश्न शुल्क",
+    "objection_mode": "आपत्ति मोड", "objection_link": "आपत्ति दर्ज करें",
+    "objection_address": "आपत्ति पता", "payment_mode": "भुगतान मोड",
+    "answer_key_type": "आंसर की प्रकार",
+    "course": "कोर्स", "course_duration": "कोर्स अवधि",
+    "university_name": "यूनिवर्सिटी", "eligibility_marks": "योग्यता मार्क्स",
+    "age_criteria": "उम्र मानदंड", "fee_structure": "फ़ीस संरचना",
+    "apply_start_date": "आवेदन शुरू", "admission_mode": "एडमिशन मोड",
+    "total_seats": "कुल सीटें", "entrance_exam_name": "एंट्रेंस एग्ज़ाम",
+    "hostel_available": "हॉस्टल उपलब्ध", "prospectus_link": "प्रॉस्पेक्टस देखें",
     "counselling_date": "काउंसलिंग तारीख़", "counselling_time": "समय",
-    "venue": "स्थान",
+    "round": "राउंड", "seat_matrix": "सीट मैट्रिक्स",
+    "registration_fee": "रजिस्ट्रेशन शुल्क",
+    "choice_filling_dates": "चॉइस फिलिंग तारीख़ें",
+    "required_documents": "ज़रूरी दस्तावेज़",
+    "counselling_mode": "काउंसलिंग मोड", "next_round_date": "अगला राउंड",
     "scheme_name": "स्कीम", "amount": "अमाउंट / रकम",
-    "eligibility": "कौन अप्लाई कर सकता है", "applicable_category": "किस श्रेणी के लिए",
-    "income_limit": "आय सीमा",
+    "scholarship_duration": "अवधि",
+    "applicable_category": "किस श्रेणी के लिए", "income_limit": "आय सीमा",
+    "apply_mode": "आवेदन मोड", "portal_name": "पोर्टल",
+    "disbursement_mode": "भुगतान मोड", "renewal_criteria": "नवीनीकरण मानदंड",
+    "income_certificate_required": "आय प्रमाण पत्र ज़रूरी",
+    "caste_certificate_required": "जाति प्रमाण पत्र ज़रूरी",
+    "selection_criteria": "चयन मानदंड", "helpline": "हेल्पलाइन",
     "exam_start_date": "एग्ज़ाम शुरू", "exam_end_date": "एग्ज़ाम ख़त्म",
-    "exam_time": "एग्ज़ाम का समय", "timetable_link": "टाइम टेबल देखें",
-    "round": "राउंड",
-    "tender_no": "निविदा संख्या", "work_description": "कार्य विवरण",
-    "issuing_authority": "जारीकर्ता विभाग", "estimated_cost": "अनुमानित लागत",
-    "emd_amount": "EMD / बयाना राशि", "tender_fee": "निविदा शुल्क",
+    "timetable_link": "टाइम टेबल देखें", "subject_list": "विषय सूची",
+    "paper_code": "पेपर कोड", "practical_dates": "प्रैक्टिकल तारीख़ें",
+    "viva_dates": "वाइवा तारीख़ें",
+    "tender_no": "निविदा संख्या", "tender_type": "निविदा प्रकार",
+    "work_description": "कार्य विवरण",
+    "estimated_cost": "अनुमानित लागत",
+    "emd_amount": "EMD / बयाना राशि", "emd_mode": "EMD मोड",
+    "tender_fee": "निविदा शुल्क", "tender_fee_mode": "निविदा शुल्क मोड",
     "submission_last_date": "जमा आख़िरी", "opening_date": "खोलने की तारीख़",
+    "pre_bid_meeting_date": "प्री-बिड मीटिंग तारीख़",
+    "pre_bid_meeting_venue": "प्री-बिड मीटिंग स्थान",
     "submission_mode": "जमा तरीक़ा", "download_tender": "निविदा डाउनलोड करें",
+    "tender_document_link": "निविदा दस्तावेज़",
+    "bid_validity": "बिड वैधता", "completion_period": "पूर्णता अवधि",
+    "payment_terms": "भुगतान शर्तें", "eligibility_criteria": "पात्रता मानदंड",
     "gazette_no": "गजट संख्या", "gazette_type": "गजट प्रकार",
     "publication_date": "प्रकाशन तारीख़", "gazette_link": "गजट देखें",
+    "gazette_content": "गजट विवरण",
     "notification_no": "अधिसूचना संख्या", "land_location": "भूमि स्थान",
-    "affected_area": "प्रभावित क्षेत्र", "notification_type": "अधिसूचना प्रकार",
-    "effective_date": "प्रभावी तारीख़", "order_link": "आदेश देखें",
+    "affected_area": "प्रभावित क्षेत्र", "plot_numbers": "प्लॉट संख्या",
+    "khasra_no": "खसरा संख्या", "thana_no": "थाना संख्या",
+    "district": "ज़िला", "tehsil": "तहसील", "village": "गाँव",
+    "notification_type": "अधिसूचना प्रकार", "effective_date": "प्रभावी तारीख़",
+    "order_link": "आदेश देखें", "compensation_details": "मुआवज़ा विवरण",
+    "objections_last_date": "आपत्ति आख़िरी",
+    "objections_address": "आपत्ति पता", "land_type": "भूमि प्रकार",
     "issuing_department": "विभाग", "release_date": "जारी तारीख़",
-    "reference_no": "संदर्भ संख्या", "release_link": "प्रेस रिलीज़ देखें",
+    "release_link": "प्रेस रिलीज़ देखें", "full_content": "पूरा विवरण",
+    "announcement_type": "घोषणा प्रकार",
+    "target_audience": "किसके लिए", "action_required": "क्या करना है",
+    "action_deadline": "करने की आख़िरी तारीख़",
     "publication_name": "प्रकाशन", "publication_type": "प्रकार",
     "publisher": "प्रकाशक", "download_link": "डाउनलोड करें",
-    "subject": "विषय",
+    "author": "लेखक", "pages": "पृष्ठ", "language": "भाषा",
+    "edition": "संस्करण", "isbn": "ISBN", "price": "क़ीमत",
+    "subject": "विषय", "notice_type": "सूचना प्रकार",
+    "applicable_to": "किस पर लागू", "supersedes": "किसे रद्द करता है",
+    "other_details": "अन्य जानकारी",
     "read_full": "पूरी नोटिफिकेशन देखें",
 }
 
 _LABELS_EN = {
+    "reference_number": "Reference No", "issuing_authority": "Issuing Authority",
+    "issuing_date": "Issuing Date", "contact_person": "Contact Person",
+    "contact_number": "Contact Number", "email": "Email",
+    "helpline_number": "Helpline", "official_address": "Official Address",
+    "important_instructions": "Important Instructions",
     "total_posts": "Total Posts", "post_breakdown": "Post-wise Breakdown",
     "qualification": "Qualification", "age_limit": "Age Limit",
-    "pay_scale": "Pay Scale", "application_fee": "Application Fee",
+    "age_relaxation": "Age Relaxation", "pay_scale": "Pay Scale",
+    "salary_type": "Salary Type", "application_fee": "Application Fee",
+    "application_start_date": "Application Starts",
     "last_date": "Last Date", "apply_online": "Apply Online",
+    "advertisement_no": "Advertisement No", "how_to_apply": "How to Apply",
+    "documents_required": "Documents Required",
+    "selection_process": "Selection Process",
+    "experience_required": "Experience Required",
+    "posting_location": "Posting Location",
+    "reservation_details": "Reservation Details",
+    "bond_details": "Bond Details",
+    "interview_date": "Interview Date", "interview_time": "Interview Time",
+    "venue": "Venue", "reporting_time": "Reporting Time",
+    "engagement_type": "Engagement Type",
     "result_for": "Result For", "declared_on": "Declared",
     "check_result": "Check Result", "session": "Session",
-    "semester": "Semester",
+    "semester": "Semester", "result_type": "Result Type",
+    "merit_list_link": "Merit List", "cutoff_marks": "Cutoff Marks",
+    "total_selected": "Total Selected", "next_stage": "Next Stage",
+    "next_stage_date": "Next Stage Date",
     "rechecking_last_date": "Rechecking Last Date", "rechecking_link": "Rechecking Link",
+    "rechecking_fee": "Rechecking Fee", "rechecking_mode": "Rechecking Mode",
     "exam": "Exam", "exam_date": "Exam Date",
+    "exam_time": "Exam Time", "exam_duration": "Exam Duration",
+    "exam_pattern": "Exam Pattern", "exam_center": "Exam Center",
     "download_admit_card": "Download Admit Card",
     "download_start_date": "Download Starts", "download_last_date": "Download Last Date",
-    "view_answer_key": "View Answer Key",
+    "instructions": "Instructions", "download_mode": "Download Mode",
+    "view_answer_key": "View Answer Key", "total_questions": "Total Questions",
     "objection_start_date": "Objection Starts", "objection_last_date": "Objection Last Date",
-    "objection_fee": "Objection Fee", "objection_link": "File Objection",
-    "course": "Course", "university_name": "University",
+    "objection_fee": "Objection Fee", "per_question_fee": "Per Question Fee",
+    "objection_mode": "Objection Mode", "objection_link": "File Objection",
+    "objection_address": "Objection Address", "payment_mode": "Payment Mode",
+    "answer_key_type": "Answer Key Type",
+    "course": "Course", "course_duration": "Course Duration",
+    "university_name": "University", "eligibility_marks": "Eligibility Marks",
+    "age_criteria": "Age Criteria", "fee_structure": "Fee Structure",
+    "apply_start_date": "Application Starts", "admission_mode": "Admission Mode",
+    "total_seats": "Total Seats", "entrance_exam_name": "Entrance Exam",
+    "hostel_available": "Hostel Available", "prospectus_link": "Prospectus",
     "counselling_date": "Counselling Date", "counselling_time": "Time",
-    "venue": "Venue",
+    "round": "Round", "seat_matrix": "Seat Matrix",
+    "registration_fee": "Registration Fee",
+    "choice_filling_dates": "Choice Filling Dates",
+    "required_documents": "Documents Required",
+    "counselling_mode": "Counselling Mode", "next_round_date": "Next Round",
     "scheme_name": "Scheme", "amount": "Amount",
-    "eligibility": "Eligibility", "applicable_category": "Applicable Category",
-    "income_limit": "Income Limit",
+    "scholarship_duration": "Duration",
+    "applicable_category": "Applicable Category", "income_limit": "Income Limit",
+    "apply_mode": "Application Mode", "portal_name": "Portal",
+    "disbursement_mode": "Disbursement Mode", "renewal_criteria": "Renewal Criteria",
+    "income_certificate_required": "Income Certificate Required",
+    "caste_certificate_required": "Caste Certificate Required",
+    "selection_criteria": "Selection Criteria", "helpline": "Helpline",
     "exam_start_date": "Exam Starts", "exam_end_date": "Exam Ends",
-    "exam_time": "Exam Time", "timetable_link": "View Timetable",
-    "round": "Round",
-    "tender_no": "Tender No", "work_description": "Work Description",
-    "issuing_authority": "Issuing Authority", "estimated_cost": "Estimated Cost",
-    "emd_amount": "EMD", "tender_fee": "Tender Fee",
+    "timetable_link": "Timetable", "subject_list": "Subjects",
+    "paper_code": "Paper Code", "practical_dates": "Practical Dates",
+    "viva_dates": "Viva Dates",
+    "tender_no": "Tender No", "tender_type": "Tender Type",
+    "work_description": "Work Description",
+    "estimated_cost": "Estimated Cost",
+    "emd_amount": "EMD", "emd_mode": "EMD Mode",
+    "tender_fee": "Tender Fee", "tender_fee_mode": "Fee Mode",
     "submission_last_date": "Submission Last Date", "opening_date": "Opening Date",
+    "pre_bid_meeting_date": "Pre-Bid Meeting Date",
+    "pre_bid_meeting_venue": "Pre-Bid Meeting Venue",
     "submission_mode": "Submission Mode", "download_tender": "Download Tender",
+    "tender_document_link": "Tender Document",
+    "bid_validity": "Bid Validity", "completion_period": "Completion Period",
+    "payment_terms": "Payment Terms", "eligibility_criteria": "Eligibility",
     "gazette_no": "Gazette No", "gazette_type": "Gazette Type",
     "publication_date": "Publication Date", "gazette_link": "View Gazette",
+    "gazette_content": "Gazette Content",
     "notification_no": "Notification No", "land_location": "Land Location",
-    "affected_area": "Affected Area", "notification_type": "Notification Type",
-    "effective_date": "Effective Date", "order_link": "View Order",
+    "affected_area": "Affected Area", "plot_numbers": "Plot Numbers",
+    "khasra_no": "Khasra No", "thana_no": "Thana No",
+    "district": "District", "tehsil": "Tehsil", "village": "Village",
+    "notification_type": "Notification Type", "effective_date": "Effective Date",
+    "order_link": "View Order", "compensation_details": "Compensation Details",
+    "objections_last_date": "Objections Last Date",
+    "objections_address": "Objections Address", "land_type": "Land Type",
     "issuing_department": "Department", "release_date": "Release Date",
-    "reference_no": "Reference No", "release_link": "View Press Release",
+    "release_link": "View Press Release", "full_content": "Full Content",
+    "announcement_type": "Announcement Type",
+    "target_audience": "Target Audience", "action_required": "Action Required",
+    "action_deadline": "Action Deadline",
     "publication_name": "Publication", "publication_type": "Type",
     "publisher": "Publisher", "download_link": "Download",
-    "subject": "Subject",
+    "author": "Author", "pages": "Pages", "language": "Language",
+    "edition": "Edition", "isbn": "ISBN", "price": "Price",
+    "subject": "Subject", "notice_type": "Notice Type",
+    "applicable_to": "Applicable To", "supersedes": "Supersedes",
+    "other_details": "Other Details",
     "read_full": "View Full Notice",
 }
 
@@ -1364,6 +1815,19 @@ def _link_line(lines, emoji, label, url):
         lines.append(f'{emoji} <a href="{html.escape(url, quote=True)}">{html.escape(_labels(label))}</a>')
 
 
+def _format_extra_details(lines, c):
+    details = c.get("extra_details") or []
+    if not details:
+        return
+    lines.append("")
+    lines.append(f"📋 <b>{_labels('other_details')}:</b>")
+    for d in details[:10]:
+        label = _safe_str(d.get("label"), 100)
+        value = _safe_str(d.get("value"), 300)
+        if label and value:
+            lines.append(f"   • <b>{html.escape(label)}:</b> {html.escape(value)}")
+
+
 def _format_vacancy(lines, c):
     total = c.get("total_posts")
     if total:
@@ -1377,12 +1841,32 @@ def _format_vacancy(lines, c):
             vac = pd.get("vacancies")
             vac_str = f" — {vac}" if vac is not None else ""
             lines.append(f"   • {pname} ({cat}){vac_str}")
+    _line(lines, "📋", "advertisement_no", _safe_str(c.get("advertisement_no")))
+    _line(lines, "🏢", "issuing_authority", _safe_str(c.get("issuing_authority")))
     _line(lines, "🎓", "qualification", _safe_str(c.get("qualification")))
     _line(lines, "🎂", "age_limit", _safe_str(c.get("age_limit")))
+    _line(lines, "🎂", "age_relaxation", _safe_str(c.get("age_relaxation")))
+    _line(lines, "📋", "engagement_type", _safe_str(c.get("engagement_type")))
+    _line(lines, "📋", "salary_type", _safe_str(c.get("salary_type")))
     _line(lines, "💰", "pay_scale", _safe_str(c.get("pay_scale")))
+    _line(lines, "📋", "experience_required", _safe_str(c.get("experience_required")))
+    _line(lines, "📋", "posting_location", _safe_str(c.get("posting_location")))
+    _line(lines, "📋", "reservation_details", _safe_str(c.get("reservation_details")))
     _line(lines, "💳", "application_fee", _safe_str(c.get("application_fee")))
+    _line(lines, "📋", "how_to_apply", _safe_str(c.get("how_to_apply")))
+    _line(lines, "📋", "selection_process", _safe_str(c.get("selection_process")))
+    _line(lines, "📋", "documents_required", _safe_str(c.get("documents_required")))
+    _line(lines, "📅", "application_start_date", _safe_str(c.get("application_start_date")))
     _line(lines, "📅", "last_date", _safe_str(c.get("last_date")))
+    _line(lines, "📅", "interview_date", _safe_str(c.get("interview_date")))
+    _line(lines, "⏰", "interview_time", _safe_str(c.get("interview_time")))
+    _line(lines, "⏰", "reporting_time", _safe_str(c.get("reporting_time")))
+    _line(lines, "📍", "venue", _safe_str(c.get("venue")))
+    _line(lines, "📋", "bond_details", _safe_str(c.get("bond_details")))
+    _line(lines, "📞", "contact_number", _safe_str(c.get("contact_number")))
+    _line(lines, "📧", "email", _safe_str(c.get("email")))
     _link_line(lines, "🌐", "apply_online", _safe_str(c.get("apply_link"), 500))
+    _format_extra_details(lines, c)
 
 
 def _format_result(lines, c):
@@ -1390,10 +1874,19 @@ def _format_result(lines, c):
     _line(lines, "📝", "exam", _safe_str(c.get("exam_name")))
     _line(lines, "📅", "session", _safe_str(c.get("session")))
     _line(lines, "📚", "semester", _safe_str(c.get("semester")))
+    _line(lines, "📋", "result_type", _safe_str(c.get("result_type")))
     _line(lines, "📅", "declared_on", _safe_str(c.get("result_date")))
+    _line(lines, "📊", "total_selected", _safe_str(c.get("total_selected")))
+    _line(lines, "📋", "cutoff_marks", _safe_str(c.get("cutoff_marks")))
     _link_line(lines, "📄", "check_result", _safe_str(c.get("result_link"), 500))
+    _link_line(lines, "📄", "merit_list_link", _safe_str(c.get("merit_list_link"), 500))
+    _line(lines, "📋", "next_stage", _safe_str(c.get("next_stage")))
+    _line(lines, "📅", "next_stage_date", _safe_str(c.get("next_stage_date")))
     _line(lines, "🔄", "rechecking_last_date", _safe_str(c.get("rechecking_last_date")))
+    _line(lines, "💳", "rechecking_fee", _safe_str(c.get("rechecking_fee")))
     _link_line(lines, "🔗", "rechecking_link", _safe_str(c.get("rechecking_link"), 500))
+    _line(lines, "📞", "helpline_number", _safe_str(c.get("helpline_number")))
+    _format_extra_details(lines, c)
 
 
 def _format_admit_card(lines, c):
@@ -1401,30 +1894,58 @@ def _format_admit_card(lines, c):
     _line(lines, "📅", "session", _safe_str(c.get("session")))
     _line(lines, "📚", "semester", _safe_str(c.get("semester")))
     _line(lines, "📅", "exam_date", _safe_str(c.get("exam_date")))
+    _line(lines, "⏰", "exam_time", _safe_str(c.get("exam_time")))
+    _line(lines, "⏱️", "exam_duration", _safe_str(c.get("exam_duration")))
+    _line(lines, "📋", "exam_pattern", _safe_str(c.get("exam_pattern")))
+    _line(lines, "📍", "exam_center", _safe_str(c.get("exam_center")))
+    _line(lines, "⏰", "reporting_time", _safe_str(c.get("reporting_time")))
     _line(lines, "⬇️", "download_start_date", _safe_str(c.get("download_start_date")))
     _line(lines, "📅", "download_last_date", _safe_str(c.get("download_last_date")))
+    _line(lines, "📋", "instructions", _safe_str(c.get("instructions")))
+    _line(lines, "📞", "helpline_number", _safe_str(c.get("helpline_number")))
     _link_line(lines, "🎫", "download_admit_card", _safe_str(c.get("admit_card_link"), 500))
+    _format_extra_details(lines, c)
 
 
 def _format_answer_key(lines, c):
     _line(lines, "📝", "exam", _safe_str(c.get("exam_name")))
     _line(lines, "📅", "session", _safe_str(c.get("session")))
+    _line(lines, "📅", "exam_date", _safe_str(c.get("exam_date")))
+    _line(lines, "📋", "total_questions", _safe_str(c.get("total_questions")))
+    _line(lines, "📋", "answer_key_type", _safe_str(c.get("answer_key_type")))
     _link_line(lines, "🔑", "view_answer_key", _safe_str(c.get("answer_key_link"), 500))
     _line(lines, "📅", "objection_start_date", _safe_str(c.get("objection_start_date")))
     _line(lines, "📅", "objection_last_date", _safe_str(c.get("objection_last_date")))
     _line(lines, "💳", "objection_fee", _safe_str(c.get("objection_fee")))
+    _line(lines, "💳", "per_question_fee", _safe_str(c.get("per_question_fee")))
+    _line(lines, "📋", "objection_mode", _safe_str(c.get("objection_mode")))
+    _line(lines, "💳", "payment_mode", _safe_str(c.get("payment_mode")))
+    _line(lines, "📍", "objection_address", _safe_str(c.get("objection_address")))
     _link_line(lines, "🔗", "objection_link", _safe_str(c.get("objection_link"), 500))
+    _format_extra_details(lines, c)
 
 
 def _format_admission(lines, c):
     _line(lines, "🎓", "course", _safe_str(c.get("course_name")))
+    _line(lines, "📅", "course_duration", _safe_str(c.get("course_duration")))
     _line(lines, "🏛️", "university_name", _safe_str(c.get("university_name")))
     _line(lines, "📅", "session", _safe_str(c.get("session")))
+    _line(lines, "📋", "admission_mode", _safe_str(c.get("admission_mode")))
+    _line(lines, "📋", "entrance_exam_name", _safe_str(c.get("entrance_exam_name")))
+    _line(lines, "📊", "total_seats", _safe_str(c.get("total_seats")))
     _line(lines, "✅", "eligibility", _safe_str(c.get("eligibility")))
+    _line(lines, "📋", "eligibility_marks", _safe_str(c.get("eligibility_marks")))
+    _line(lines, "🎂", "age_criteria", _safe_str(c.get("age_criteria")))
     _line(lines, "💳", "application_fee", _safe_str(c.get("application_fee")))
+    _line(lines, "💰", "fee_structure", _safe_str(c.get("fee_structure")))
+    _line(lines, "📋", "hostel_available", _safe_str(c.get("hostel_available")))
+    _line(lines, "📋", "documents_required", _safe_str(c.get("documents_required")))
+    _line(lines, "📅", "apply_start_date", _safe_str(c.get("apply_start_date")))
     _line(lines, "📅", "last_date", _safe_str(c.get("last_date")))
     _line(lines, "🎯", "counselling_date", _safe_str(c.get("counselling_date")))
+    _link_line(lines, "📄", "prospectus_link", _safe_str(c.get("prospectus_link"), 500))
     _link_line(lines, "🌐", "apply_online", _safe_str(c.get("apply_link"), 500))
+    _format_extra_details(lines, c)
 
 
 def _format_counselling(lines, c):
@@ -1433,17 +1954,34 @@ def _format_counselling(lines, c):
     _line(lines, "📅", "counselling_date", _safe_str(c.get("counselling_date")))
     _line(lines, "⏰", "counselling_time", _safe_str(c.get("counselling_time")))
     _line(lines, "📍", "venue", _safe_str(c.get("venue")))
+    _line(lines, "💳", "registration_fee", _safe_str(c.get("registration_fee")))
+    _line(lines, "📋", "seat_matrix", _safe_str(c.get("seat_matrix")))
+    _line(lines, "📅", "choice_filling_dates", _safe_str(c.get("choice_filling_dates")))
+    _line(lines, "📋", "required_documents", _safe_str(c.get("required_documents")))
+    _line(lines, "📋", "counselling_mode", _safe_str(c.get("counselling_mode")))
+    _line(lines, "📅", "next_round_date", _safe_str(c.get("next_round_date")))
     _link_line(lines, "🌐", "apply_online", _safe_str(c.get("apply_link"), 500))
+    _format_extra_details(lines, c)
 
 
 def _format_scholarship(lines, c):
     _line(lines, "🎯", "scheme_name", _safe_str(c.get("scheme_name")))
     _line(lines, "💰", "amount", _safe_str(c.get("scholarship_amount")))
+    _line(lines, "📅", "scholarship_duration", _safe_str(c.get("scholarship_duration")))
     _line(lines, "👥", "applicable_category", _safe_str(c.get("applicable_category")))
     _line(lines, "💵", "income_limit", _safe_str(c.get("income_limit")))
     _line(lines, "🎓", "eligibility", _safe_str(c.get("eligibility")))
+    _line(lines, "📋", "renewal_criteria", _safe_str(c.get("renewal_criteria")))
+    _line(lines, "📋", "selection_criteria", _safe_str(c.get("selection_criteria")))
+    _line(lines, "📋", "income_certificate_required", _safe_str(c.get("income_certificate_required")))
+    _line(lines, "📋", "caste_certificate_required", _safe_str(c.get("caste_certificate_required")))
+    _line(lines, "📋", "apply_mode", _safe_str(c.get("apply_mode")))
+    _line(lines, "📋", "portal_name", _safe_str(c.get("portal_name")))
+    _line(lines, "💳", "disbursement_mode", _safe_str(c.get("disbursement_mode")))
     _line(lines, "📅", "last_date", _safe_str(c.get("last_date")))
+    _line(lines, "📞", "helpline", _safe_str(c.get("helpline")))
     _link_line(lines, "🌐", "apply_online", _safe_str(c.get("apply_link"), 500))
+    _format_extra_details(lines, c)
 
 
 def _format_exam_schedule(lines, c):
@@ -1454,20 +1992,38 @@ def _format_exam_schedule(lines, c):
     _line(lines, "📅", "exam_start_date", _safe_str(c.get("exam_start_date")))
     _line(lines, "📅", "exam_end_date", _safe_str(c.get("exam_end_date")))
     _line(lines, "⏰", "exam_time", _safe_str(c.get("exam_time")))
+    _line(lines, "📍", "exam_center", _safe_str(c.get("exam_center")))
+    _line(lines, "📋", "subject_list", _safe_str(c.get("subject_list")))
+    _line(lines, "📋", "paper_code", _safe_str(c.get("paper_code")))
+    _line(lines, "📅", "practical_dates", _safe_str(c.get("practical_dates")))
+    _line(lines, "📅", "viva_dates", _safe_str(c.get("viva_dates")))
+    _line(lines, "⏰", "reporting_time", _safe_str(c.get("reporting_time")))
     _link_line(lines, "📄", "timetable_link", _safe_str(c.get("timetable_link"), 500))
+    _format_extra_details(lines, c)
 
 
 def _format_tender(lines, c):
     _line(lines, "📋", "tender_no", _safe_str(c.get("tender_no")))
+    _line(lines, "📋", "tender_type", _safe_str(c.get("tender_type")))
     _line(lines, "📝", "work_description", _safe_str(c.get("work_description")))
     _line(lines, "🏢", "issuing_authority", _safe_str(c.get("issuing_authority")))
     _line(lines, "💰", "estimated_cost", _safe_str(c.get("estimated_cost")))
     _line(lines, "💳", "emd_amount", _safe_str(c.get("emd_amount")))
+    _line(lines, "💳", "emd_mode", _safe_str(c.get("emd_mode")))
     _line(lines, "📄", "tender_fee", _safe_str(c.get("tender_fee")))
+    _line(lines, "💳", "tender_fee_mode", _safe_str(c.get("tender_fee_mode")))
+    _line(lines, "📅", "pre_bid_meeting_date", _safe_str(c.get("pre_bid_meeting_date")))
+    _line(lines, "📍", "pre_bid_meeting_venue", _safe_str(c.get("pre_bid_meeting_venue")))
     _line(lines, "📅", "submission_last_date", _safe_str(c.get("submission_last_date")))
     _line(lines, "📅", "opening_date", _safe_str(c.get("opening_date")))
+    _line(lines, "📅", "bid_validity", _safe_str(c.get("bid_validity")))
+    _line(lines, "📅", "completion_period", _safe_str(c.get("completion_period")))
     _line(lines, "🌐", "submission_mode", _safe_str(c.get("submission_mode")))
+    _line(lines, "📋", "eligibility_criteria", _safe_str(c.get("eligibility_criteria")))
+    _line(lines, "💳", "payment_terms", _safe_str(c.get("payment_terms")))
+    _link_line(lines, "📄", "tender_document_link", _safe_str(c.get("tender_document_link"), 500))
     _link_line(lines, "🔗", "download_tender", _safe_str(c.get("apply_link"), 500))
+    _format_extra_details(lines, c)
 
 
 def _format_gazette(lines, c):
@@ -1476,50 +2032,85 @@ def _format_gazette(lines, c):
     _line(lines, "📝", "subject", _safe_str(c.get("subject")))
     _line(lines, "🏢", "issuing_authority", _safe_str(c.get("issuing_authority")))
     _line(lines, "📅", "publication_date", _safe_str(c.get("publication_date")))
+    _line(lines, "📅", "effective_date", _safe_str(c.get("effective_date")))
+    _line(lines, "📋", "gazette_content", _safe_str(c.get("gazette_content")))
     _link_line(lines, "🔗", "gazette_link", _safe_str(c.get("gazette_link"), 500))
+    _format_extra_details(lines, c)
 
 
 def _format_land_revenue(lines, c):
     _line(lines, "📋", "notification_no", _safe_str(c.get("notification_no")))
     _line(lines, "📝", "subject", _safe_str(c.get("subject")))
-    _line(lines, "🏞️", "land_location", _safe_str(c.get("land_location")))
-    _line(lines, "📐", "affected_area", _safe_str(c.get("affected_area")))
     _line(lines, "🔖", "notification_type", _safe_str(c.get("notification_type")))
+    _line(lines, "🏞️", "land_location", _safe_str(c.get("land_location")))
+    _line(lines, "📍", "village", _safe_str(c.get("village")))
+    _line(lines, "📍", "tehsil", _safe_str(c.get("tehsil")))
+    _line(lines, "📍", "district", _safe_str(c.get("district")))
+    _line(lines, "📐", "plot_numbers", _safe_str(c.get("plot_numbers")))
+    _line(lines, "📐", "khasra_no", _safe_str(c.get("khasra_no")))
+    _line(lines, "📐", "thana_no", _safe_str(c.get("thana_no")))
+    _line(lines, "📐", "affected_area", _safe_str(c.get("affected_area")))
+    _line(lines, "📋", "land_type", _safe_str(c.get("land_type")))
+    _line(lines, "💰", "compensation_details", _safe_str(c.get("compensation_details")))
     _line(lines, "🏢", "issuing_authority", _safe_str(c.get("issuing_authority")))
     _line(lines, "📅", "effective_date", _safe_str(c.get("effective_date")))
+    _line(lines, "📅", "objections_last_date", _safe_str(c.get("objections_last_date")))
+    _line(lines, "📍", "objections_address", _safe_str(c.get("objections_address")))
     _link_line(lines, "🔗", "order_link", _safe_str(c.get("order_link"), 500))
+    _format_extra_details(lines, c)
 
 
 def _format_press_release(lines, c):
     _line(lines, "📝", "subject", _safe_str(c.get("subject")))
     _line(lines, "🏢", "issuing_department", _safe_str(c.get("issuing_department")))
     _line(lines, "📅", "release_date", _safe_str(c.get("release_date")))
-    _line(lines, "🔖", "reference_no", _safe_str(c.get("reference_no")))
+    _line(lines, "🔖", "reference_no", _safe_str(c.get("reference_number")))
+    _line(lines, "📋", "full_content", _safe_str(c.get("full_content")))
     _link_line(lines, "🔗", "release_link", _safe_str(c.get("release_link"), 500))
+    _format_extra_details(lines, c)
 
 
 def _format_announcement(lines, c):
     _line(lines, "📝", "subject", _safe_str(c.get("subject")))
     _line(lines, "🏢", "issuing_authority", _safe_str(c.get("issuing_authority")))
-    _line(lines, "🔖", "reference_no", _safe_str(c.get("reference_no")))
+    _line(lines, "🔖", "reference_no", _safe_str(c.get("reference_number")))
+    _line(lines, "📋", "announcement_type", _safe_str(c.get("announcement_type")))
+    _line(lines, "👥", "target_audience", _safe_str(c.get("target_audience")))
+    _line(lines, "📋", "action_required", _safe_str(c.get("action_required")))
+    _line(lines, "📅", "action_deadline", _safe_str(c.get("action_deadline")))
     _line(lines, "📅", "effective_date", _safe_str(c.get("effective_date")))
     _link_line(lines, "🌐", "apply_online", _safe_str(c.get("apply_link"), 500))
+    _format_extra_details(lines, c)
 
 
 def _format_publication(lines, c):
     _line(lines, "📚", "publication_name", _safe_str(c.get("publication_name")))
     _line(lines, "🔖", "publication_type", _safe_str(c.get("publication_type")))
+    _line(lines, "✍️", "author", _safe_str(c.get("author")))
     _line(lines, "🏢", "publisher", _safe_str(c.get("publisher")))
     _line(lines, "📅", "publication_date", _safe_str(c.get("publication_date")))
+    _line(lines, "📋", "language", _safe_str(c.get("language")))
+    _line(lines, "📋", "edition", _safe_str(c.get("edition")))
+    _line(lines, "📋", "pages", _safe_str(c.get("pages")))
+    _line(lines, "📋", "isbn", _safe_str(c.get("isbn")))
+    _line(lines, "💰", "price", _safe_str(c.get("price")))
     _link_line(lines, "🔗", "download_link", _safe_str(c.get("download_link"), 500))
+    _format_extra_details(lines, c)
 
 
 def _format_notice(lines, c):
     _line(lines, "📝", "subject", _safe_str(c.get("subject")))
-    _line(lines, "🔖", "reference_no", _safe_str(c.get("reference_no")))
+    _line(lines, "📋", "notice_type", _safe_str(c.get("notice_type")))
+    _line(lines, "🔖", "reference_no", _safe_str(c.get("reference_number")))
     _line(lines, "🏢", "issuing_authority", _safe_str(c.get("issuing_authority")))
+    _line(lines, "👥", "applicable_to", _safe_str(c.get("applicable_to")))
+    _line(lines, "📋", "action_required", _safe_str(c.get("action_required")))
+    _line(lines, "📅", "action_deadline", _safe_str(c.get("action_deadline")))
+    _line(lines, "📋", "supersedes", _safe_str(c.get("supersedes")))
     _line(lines, "📅", "effective_date", _safe_str(c.get("effective_date")))
+    _line(lines, "📋", "important_instructions", _safe_str(c.get("important_instructions")))
     _link_line(lines, "🔗", "order_link", _safe_str(c.get("order_link"), 500))
+    _format_extra_details(lines, c)
 
 
 _FORMATTERS = {
@@ -1553,7 +2144,9 @@ def format_message(site, item, classification=None):
     category = (classification.get("category") or "notice").lower()
     emoji = CATEGORY_EMOJI.get(category, "📌")
 
-    lines = [f"🔔 <b>{site_name}</b>", "", f"<b>{title}</b>", ""]
+    ocr_marker = " 🔍" if item.get("ocr_used") else ""
+
+    lines = [f"🔔 <b>{site_name}</b>", "", f"<b>{title}</b>{ocr_marker}", ""]
     if summary:
         lines.append(summary)
         lines.append("")
@@ -1620,6 +2213,11 @@ def refresh_stats(state):
 # ---------------------------------------------------------------------------
 
 def _fetch_pdfs_for_batch(batch, scan):
+    """
+    Fetch PDF text with low parallelism — OCR is CPU-bound, so
+    default is sequential (OCR_MAX_WORKERS=1). Non-OCR PDFs still
+    work quickly because pdfplumber is fast.
+    """
     targets = [
         (iid, record)
         for iid, record in batch
@@ -1637,20 +2235,22 @@ def _fetch_pdfs_for_batch(batch, scan):
             return download_pdf_text(make_session(), record["url"], timeout)
         except Exception as exc:
             print(f"[WARN] PDF fetch error: {exc}", file=sys.stderr)
-            return ""
+            return "", False
 
-    with ThreadPoolExecutor(max_workers=3) as ex:
+    workers = max(1, min(OCR_MAX_WORKERS, len(targets)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
         futures = {ex.submit(_fetch_one, record): (iid, record) for iid, record in targets}
         for fut in as_completed(futures):
             iid, record = futures[fut]
             try:
-                text = fut.result()
+                text, ocr_used = fut.result()
             except Exception:
-                text = ""
+                text, ocr_used = "", False
             record["pdf_attempts"] = int(record.get("pdf_attempts", 0)) + 1
             if text:
                 record["pdf_text"] = text[:MAX_PDF_TEXT_CHARS]
                 record["pdf_extracted"] = True
+                record["ocr_used"] = bool(ocr_used)
 
 
 def _parse_upload_date(raw):
@@ -1739,7 +2339,8 @@ def main():
                     "first_seen": utc_now(), "last_seen": utc_now(),
                     "status": "baseline", "attempts": 0, "summary": "",
                     "classification": None, "pdf_extracted": False,
-                    "pdf_text": "", "pdf_attempts": 0, "telegram_attempts": 0,
+                    "pdf_text": "", "pdf_attempts": 0, "ocr_used": False,
+                    "telegram_attempts": 0,
                     "upload_date": candidate.get("upload_date"),
                     "last_error": None,
                 })
@@ -1772,7 +2373,8 @@ def main():
                         "first_seen": utc_now(), "last_seen": utc_now(),
                         "status": "baseline", "attempts": 0, "summary": "",
                         "classification": None, "pdf_extracted": False,
-                        "pdf_text": "", "pdf_attempts": 0, "telegram_attempts": 0,
+                        "pdf_text": "", "pdf_attempts": 0, "ocr_used": False,
+                        "telegram_attempts": 0,
                         "upload_date": candidate.get("upload_date"),
                         "last_error": f"Stale (limit={STALE_NOTICE_DAYS}d)",
                     }
@@ -1787,7 +2389,8 @@ def main():
                     "first_seen": utc_now(), "last_seen": utc_now(),
                     "status": "pending", "attempts": 0, "summary": "",
                     "classification": None, "pdf_extracted": False,
-                    "pdf_text": "", "pdf_attempts": 0, "telegram_attempts": 0,
+                    "pdf_text": "", "pdf_attempts": 0, "ocr_used": False,
+                    "telegram_attempts": 0,
                     "upload_date": candidate.get("upload_date"),
                     "last_error": None,
                 }
