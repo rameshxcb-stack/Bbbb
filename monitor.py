@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import urljoin, urlparse, urlunparse, unquote
 
 import pdfplumber
 import pytesseract
@@ -103,6 +103,9 @@ _NON_NOTICE_URL_PATTERNS = [
     re.compile(r"/search(/|$)", re.I),
     re.compile(r"[?&]page=\d+", re.I),
     re.compile(r"[?&]paged=\d+", re.I),
+    # FIX #5: language-prefixed archive/listing paths (e.g. /hi/past-notices/..., /en/whats-new)
+    re.compile(r"/(hi|en|hn|ur|bn|ta|te|mr|gu|kn|ml|pa|or|as)(/|$).*(past[-_]?notices|whats[-_]?new|archive|category|notice[-_]?category|document[-_]?category|search)", re.I),
+    re.compile(r"/(hi|en|hn|ur|bn|ta|te|mr|gu|kn|ml|pa|or|as)/?$", re.I),
 ]
 
 _GENERIC_TITLES = {
@@ -182,6 +185,29 @@ def _is_empty_page_text(html_text):
         return False
     sample = html_text[:8000].lower()
     return any(phrase in sample for phrase in _EMPTY_PAGE_PHRASES)
+
+
+def _title_from_url(url, min_len=8):
+    """
+    FIX #3: Extract a human-readable title from URL path when anchor text
+    is unusable (e.g. language selectors like 'हिन्दी').
+    """
+    try:
+        path = unquote(urlparse(url).path or "")
+    except Exception:
+        return ""
+    slug = path.rstrip("/").rsplit("/", 1)[-1]
+    if not slug or slug.lower().endswith(".pdf"):
+        # For PDFs, keep filename but strip .pdf
+        slug = slug.rsplit(".", 1)[0] if "." in slug else slug
+    slug = re.sub(r"[-_]+", " ", slug)
+    slug = re.sub(r"\s+", " ", slug).strip()
+    slug = clean_text(slug, 200)
+    if len(slug) < min_len:
+        return ""
+    if _is_generic_title(slug):
+        return ""
+    return slug
 
 
 # ---------------------------------------------------------------------------
@@ -642,7 +668,12 @@ def extract_candidates(html_text, page_url, site, scan):
                 and not _is_generic_title(parent_text) and len(parent_text) >= 8):
                 title = parent_text
             else:
-                continue
+                # FIX #3: URL-based title fallback for language-selector anchors
+                url_title = _title_from_url(href, min_len=8)
+                if url_title:
+                    title = url_title
+                else:
+                    continue
 
         score = local_score(title, href, context, keywords)
         pdf_bonus = 1 if is_pdf(href) else 0
@@ -707,11 +738,23 @@ def discover_site(session, site, scan):
         if page in visited or not same_host(base_url, page):
             continue
         visited.add(page)
+
+        # FIX #1: Page-level navigation check — never fetch archive/listing pages
+        # even if they were queued via discovery keywords.
+        if _is_navigation_url(page):
+            continue
+
         try:
             response = session.get(page, timeout=timeout, allow_redirects=True)
             if response.status_code >= 400:
                 raise RuntimeError(f"HTTP {response.status_code}")
             final_url = canonical_url(response.url)
+
+            # FIX #2: After redirects, if we landed on a navigation/archive URL, skip.
+            if _is_navigation_url(final_url):
+                successful_pages += 1
+                continue
+
             content_type = response.headers.get("content-type", "").lower()
             if is_pdf(final_url) or "application/pdf" in content_type:
                 filename = final_url.rsplit("/", 1)[-1] or "PDF Notice"
