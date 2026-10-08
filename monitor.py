@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -35,13 +36,15 @@ FALLBACK_MODELS = [
 
 FUZZY_DUPLICATE_THRESHOLD = 97
 
-MAX_PDF_BYTES = 5 * 1024 * 1024
 MAX_PDF_SEND_BYTES = 45 * 1024 * 1024
-MAX_PDF_PAGES = 8
+MAX_GEMINI_PDF_BYTES = 18 * 1024 * 1024  # Gemini inline PDF ~20MB limit
+MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "8"))
 MAX_PDF_TEXT_CHARS = 4000
 MAX_PDF_ATTEMPTS = 3
 TELEGRAM_SAFE_LIMIT = 4000
 TELEGRAM_CAPTION_LIMIT = 1024
+
+_RUNTIME_PDF_CACHE_MAX_ITEMS = 50
 
 GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "16384"))
 
@@ -63,7 +66,7 @@ STALE_NOTICE_DAYS = int(os.getenv("STALE_NOTICE_DAYS", "30"))
 
 USER_AGENT = os.getenv(
     "MONITOR_USER_AGENT",
-    "Mozilla/5.0 (compatible; JharkhandNoticeMonitor/6.4)"
+    "Mozilla/5.0 (compatible; JharkhandNoticeMonitor/7.1)"
 )
 
 STRONG_KEYWORDS = [
@@ -75,11 +78,289 @@ STRONG_KEYWORDS = [
     "सूचना", "नोटिस", "निविदा"
 ]
 
-# Runtime PDF cache
 _RUNTIME_PDF_CACHE: Dict[str, bytes] = {}
-
-# Gemini API key (set in main)
 _GEMINI_API_KEY = ""
+
+
+def _cache_put(url, content):
+    """Bounded cache insertion (FIFO eviction)."""
+    if url in _RUNTIME_PDF_CACHE:
+        return
+    if len(_RUNTIME_PDF_CACHE) >= _RUNTIME_PDF_CACHE_MAX_ITEMS:
+        try:
+            first_key = next(iter(_RUNTIME_PDF_CACHE))
+            del _RUNTIME_PDF_CACHE[first_key]
+        except (StopIteration, KeyError):
+            pass
+    _RUNTIME_PDF_CACHE[url] = content
+
+
+# ---------------------------------------------------------------------------
+# PDF detection helpers
+# ---------------------------------------------------------------------------
+
+_PDF_URL_HINTS = (
+    "downloadfile", "download_file", "downloadpdf", "download_pdf",
+    "showpdf", "viewpdf", "getpdf", "filedownload", "getfile",
+)
+
+
+def _looks_like_pdf_url(url):
+    """Heuristic: does this URL likely point to a PDF?"""
+    if not url:
+        return False
+    u = url.lower()
+    if ".pdf" in u:
+        return True
+    try:
+        path = (urlparse(url).path or "").lower()
+    except Exception:
+        return False
+    if any(kw in path for kw in _PDF_URL_HINTS):
+        return True
+    return False
+
+
+def _looks_like_pdf_response(content, content_type, url=""):
+    """Check response bytes+headers to confirm PDF."""
+    if not content:
+        return False
+    ct = (content_type or "").lower()
+    if "application/pdf" in ct:
+        return True
+    if content[:4] == b"%PDF":
+        return True
+    if "application/octet-stream" in ct and content[:5] == b"%PDF-":
+        return True
+    if ("download" in ct or "x-download" in ct) and content[:4] == b"%PDF":
+        return True
+    if _looks_like_pdf_url(url) and content[:4] == b"%PDF":
+        return True
+    return False
+
+
+# ===========================================================================
+# NEW: Global PDF candidate collector
+# ===========================================================================
+
+def _collect_all_pdf_candidates(html_text, base_url, max_candidates=15):
+    """
+    HTML se SAARE possible PDF candidates collect karo, priority ke saath.
+    Content-based approach — kisi bhi pattern/text/URL pe depend nahi.
+    Returns list of (url, priority) sorted high→low.
+    """
+    if not html_text:
+        return []
+    try:
+        soup = BeautifulSoup(html_text, "html.parser")
+    except Exception:
+        return []
+
+    def _valid(href):
+        if not href or not isinstance(href, str):
+            return False
+        h = href.strip().lower()
+        if not h:
+            return False
+        if h.startswith(("#", "javascript:", "mailto:", "tel:", "data:", "whatsapp:", "fb:", "blob:")):
+            return False
+        return True
+
+    def _is_html_page(href):
+        h = href.lower()
+        for ext in (".html", ".htm", ".asp", ".aspx", ".jsp", ".php", ".cgi", ".shtml", ".css", ".js"):
+            if h.endswith(ext) or ext + "?" in h:
+                return True
+        return False
+
+    def _abs(href):
+        return canonical_url(urljoin(base_url, href))
+
+    candidates: Dict[str, int] = {}
+
+    def _add(href, priority):
+        if not _valid(href) or _is_html_page(href):
+            return
+        abs_url = _abs(href)
+        if abs_url == canonical_url(base_url):
+            return
+        if _is_navigation_url(abs_url):
+            return
+        if candidates.get(abs_url, 0) < priority:
+            candidates[abs_url] = priority
+
+    # TIER 1 (100): iframe / embed / object / source
+    for tag in soup.find_all(["iframe", "embed", "object", "source"]):
+        src = tag.get("src") or tag.get("data") or ""
+        if src and not src.lower().startswith(("javascript:", "#", "data:")):
+            _add(src, 100)
+
+    # TIER 2 (95): onclick handlers
+    for tag in soup.find_all(onclick=True):
+        onclick = tag.get("onclick", "") or ""
+        for pat in (
+            r"window\.open\(\s*['\"]([^'\"]+)['\"]",
+            r"location\.href\s*=\s*['\"]([^'\"]+)['\"]",
+            r"window\.location\s*=\s*['\"]([^'\"]+)['\"]",
+            r"window\.location\.href\s*=\s*['\"]([^'\"]+)['\"]",
+        ):
+            m = re.search(pat, onclick, re.I)
+            if m:
+                _add(m.group(1), 95)
+
+    # TIER 3 (90): <a href=".pdf">
+    for a in soup.find_all("a", href=True):
+        href = a.get("href", "")
+        if ".pdf" in href.lower() or _looks_like_pdf_url(href):
+            _add(href, 90)
+
+    # TIER 4 (80): file-serving path hints
+    _PDF_PATH_HINTS = (
+        "/writereaddata/", "/uploadfile/", "/uploads/", "/upload/",
+        "/downloadfile/", "/download_file/", "/getfile/", "/showfile/",
+        "/viewfile/", "/filedownload/", "/files/", "/media/",
+        "/attachment/", "/attachments/", "/docs/", "/documents/",
+        "/file/", "/pdf/", "/download/", "/downloads/",
+    )
+    for a in soup.find_all("a", href=True):
+        href = a.get("href", "")
+        href_lower = href.lower()
+        if any(hint in href_lower for hint in _PDF_PATH_HINTS):
+            _add(href, 80)
+
+    # TIER 5 (70/75): text-based keywords
+    _TEXT_KEYWORDS = (
+        "view", "download", "click here", "click", "open", "get",
+        "see file", "show", "read", "attachment", "file", "link",
+        "देखें", "डाउनलोड", "देखे", "खोलें", "फ़ाइल", "फाइल",
+        "विवरण", "डाउनलोड करें", "देखें यहाँ", "यहाँ देखें", "खोलिये",
+    )
+    for a in soup.find_all("a", href=True):
+        href = a.get("href", "")
+        text = a.get_text(" ", strip=True).lower()
+        if not text:
+            continue
+        if any(kw in text for kw in _TEXT_KEYWORDS):
+            priority = 70
+            if re.search(r"\d+\s*(kb|mb|bytes)", text, re.I):
+                priority = 75
+            _add(href, priority)
+
+    # TIER 6 (65): icon-only links
+    for a in soup.find_all("a", href=True):
+        href = a.get("href", "")
+        img = a.find("img")
+        if not img:
+            continue
+        img_attrs = " ".join([
+            str(img.get("src") or ""),
+            str(img.get("alt") or ""),
+            " ".join(img.get("class") or []),
+            str(img.get("title") or ""),
+        ]).lower()
+        if any(kw in img_attrs for kw in ("pdf", "document", "file", "download", "attachment", "doc")):
+            _add(href, 65)
+
+    # TIER 7 (60): near "File:" / "फ़ाइल:" label
+    _FILE_LABEL_RE = re.compile(
+        r"^(file|फ़ाइल|फाइल|attachment|संलग्नक|file\s*name|फ़ाइल\s*नाम)\s*[:\-]?\s*$",
+        re.I,
+    )
+    for label in soup.find_all(["td", "th", "label", "b", "strong", "span", "div", "dt"]):
+        label_text = label.get_text(" ", strip=True).strip()
+        if not _FILE_LABEL_RE.match(label_text):
+            continue
+        parent = label.find_parent(["tr", "li", "div", "p", "dl"]) or label.parent
+        if not parent:
+            continue
+        for a in parent.find_all("a", href=True):
+            _add(a.get("href", ""), 60)
+
+    # TIER 8 (50): target="_blank" links
+    for a in soup.find_all("a", href=True, target="_blank"):
+        _add(a.get("href", ""), 50)
+
+    # TIER 9 (30): FALLBACK — ALL remaining non-nav links
+    for a in soup.find_all("a", href=True):
+        href = a.get("href", "")
+        _add(href, 30)
+
+    ranked = sorted(candidates.items(), key=lambda x: -x[1])
+    return ranked[:max_candidates]
+
+
+def _find_pdf_link_in_html(html_text, base_url):
+    """Wrapper: highest-priority candidate return karo."""
+    ranked = _collect_all_pdf_candidates(html_text, base_url, max_candidates=1)
+    return ranked[0][0] if ranked else None
+
+
+def _download_with_pdf_resolution(session, url, timeout, depth=0, _visited=None):
+    """
+    Download url. If HTML, try multiple embedded PDF candidates.
+    Returns (content_bytes | None, actual_url, method_string).
+    """
+    if _visited is None:
+        _visited = set()
+
+    canon = canonical_url(url)
+    if canon in _visited:
+        return None, url, "already_visited"
+    _visited.add(canon)
+
+    if depth > 3:
+        return None, url, "max_depth_exceeded"
+
+    # HEAD check for size
+    try:
+        head = session.head(url, timeout=min(10, timeout), allow_redirects=True)
+        cl = head.headers.get("content-length")
+        if cl:
+            try:
+                if int(cl) > MAX_PDF_SEND_BYTES:
+                    return None, url, "size_limit_head"
+            except (TypeError, ValueError):
+                pass
+    except Exception:
+        pass
+
+    try:
+        response = session.get(url, timeout=timeout, allow_redirects=True)
+    except requests.RequestException as exc:
+        return None, url, f"request_error:{type(exc).__name__}"
+
+    if response.status_code >= 400:
+        return None, url, f"http_{response.status_code}"
+
+    content = response.content
+    content_type = response.headers.get("content-type", "").lower()
+    final_url = response.url
+
+    if _looks_like_pdf_response(content, content_type, final_url):
+        return content, final_url, "direct_pdf"
+
+    if "html" in content_type or "xhtml" in content_type or not content_type:
+        try:
+            html_text = content.decode("utf-8", errors="ignore")
+        except Exception:
+            return None, url, "html_decode_error"
+
+        # Collect ALL candidates, try in priority order
+        candidates = _collect_all_pdf_candidates(html_text, final_url, max_candidates=10)
+
+        for cand_url, priority in candidates:
+            sub_content, sub_url, sub_method = _download_with_pdf_resolution(
+                session, cand_url, timeout, depth + 1, _visited
+            )
+            if sub_content:
+                return sub_content, sub_url, f"html_wrap(p{priority})->{sub_method}"
+
+        return None, url, "html_no_pdf_found"
+
+    if content[:4] == b"%PDF":
+        return content, final_url, "magic_bytes"
+
+    return None, url, f"unsupported:{content_type[:40]}"
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +384,6 @@ _NON_NOTICE_URL_PATTERNS = [
     re.compile(r"/search(/|$)", re.I),
     re.compile(r"[?&]page=\d+", re.I),
     re.compile(r"[?&]paged=\d+", re.I),
-    # FIX #5: language-prefixed archive/listing paths (e.g. /hi/past-notices/..., /en/whats-new)
     re.compile(r"/(hi|en|hn|ur|bn|ta|te|mr|gu|kn|ml|pa|or|as)(/|$).*(past[-_]?notices|whats[-_]?new|archive|category|notice[-_]?category|document[-_]?category|search)", re.I),
     re.compile(r"/(hi|en|hn|ur|bn|ta|te|mr|gu|kn|ml|pa|or|as)/?$", re.I),
 ]
@@ -188,17 +468,13 @@ def _is_empty_page_text(html_text):
 
 
 def _title_from_url(url, min_len=8):
-    """
-    FIX #3: Extract a human-readable title from URL path when anchor text
-    is unusable (e.g. language selectors like 'हिन्दी').
-    """
+    """Extract human-readable title from URL slug (Devanagari-safe)."""
     try:
         path = unquote(urlparse(url).path or "")
     except Exception:
         return ""
     slug = path.rstrip("/").rsplit("/", 1)[-1]
     if not slug or slug.lower().endswith(".pdf"):
-        # For PDFs, keep filename but strip .pdf
         slug = slug.rsplit(".", 1)[0] if "." in slug else slug
     slug = re.sub(r"[-_]+", " ", slug)
     slug = re.sub(r"\s+", " ", slug).strip()
@@ -264,7 +540,7 @@ def _extract_full_dates(text):
                     d, mo, y = int(a), int(b), int(c)
                 if not (1 <= mo <= 12 and 1 <= d <= 31):
                     continue
-                if not (2000 <= y <= 2100):
+                if not (1990 <= y <= 2100):
                     continue
                 dates.append(datetime(y, mo, d, tzinfo=timezone.utc))
             except (ValueError, IndexError, TypeError, AttributeError):
@@ -486,7 +762,7 @@ def get_config():
 
 def default_state():
     return {
-        "version": 19,
+        "version": 20,
         "initialized": False,
         "last_run": None,
         "items": {},
@@ -531,7 +807,7 @@ def load_state():
         record.setdefault("upload_date", None)
         record.setdefault("first_seen", utc_now())
         record.setdefault("last_seen", record["first_seen"])
-    state["version"] = 19
+    state["version"] = 20
     return state
 
 
@@ -668,27 +944,49 @@ def extract_candidates(html_text, page_url, site, scan):
                 and not _is_generic_title(parent_text) and len(parent_text) >= 8):
                 title = parent_text
             else:
-                # FIX #3: URL-based title fallback for language-selector anchors
                 url_title = _title_from_url(href, min_len=8)
                 if url_title:
                     title = url_title
                 else:
                     continue
 
+        # ============================================================
+        # CHANGED: Broaden pdf_bonus to catch extension-less PDFs
+        # ============================================================
         score = local_score(title, href, context, keywords)
-        pdf_bonus = 1 if is_pdf(href) else 0
+        href_lower = href.lower()
+        pdf_bonus = 0
+        if is_pdf(href) or _looks_like_pdf_url(href):
+            pdf_bonus = 2
+        elif any(kw in href_lower for kw in (
+            "/notice/", "/document", "/writereaddata/",
+            "/uploadfile/", "/uploads/", "/upload/",
+            "/downloadfile/", "/download_file/", "/getfile/",
+            "/showfile/", "/viewfile/", "/filedownload/",
+            "/files/", "/media/", "/file/",
+            "/attachment/", "/attachments/", "/docs/",
+            "/download/", "/downloads/",
+        )):
+            pdf_bonus = 1
+        else:
+            # Fallback: any non-nav link gets a try (magic bytes will confirm)
+            pdf_bonus = 1
+
         if score <= 0 and pdf_bonus == 0:
             continue
         if href in seen:
             continue
         seen.add(href)
         upload_dt = _extract_upload_date(a)
+
+        is_pdf_or_notice = bool(pdf_bonus > 0)
+
         out.append({
             "url": href,
             "title": title or clean_text(context, 180) or href.rsplit("/", 1)[-1],
             "context": context,
             "source_page": page_url,
-            "is_pdf": is_pdf(href),
+            "is_pdf": is_pdf_or_notice,
             "score": score + pdf_bonus,
             "upload_date": upload_dt.isoformat() if upload_dt else None,
         })
@@ -739,8 +1037,6 @@ def discover_site(session, site, scan):
             continue
         visited.add(page)
 
-        # FIX #1: Page-level navigation check — never fetch archive/listing pages
-        # even if they were queued via discovery keywords.
         if _is_navigation_url(page):
             continue
 
@@ -750,21 +1046,22 @@ def discover_site(session, site, scan):
                 raise RuntimeError(f"HTTP {response.status_code}")
             final_url = canonical_url(response.url)
 
-            # FIX #2: After redirects, if we landed on a navigation/archive URL, skip.
             if _is_navigation_url(final_url):
                 successful_pages += 1
                 continue
 
             content_type = response.headers.get("content-type", "").lower()
-            if is_pdf(final_url) or "application/pdf" in content_type:
+
+            if _looks_like_pdf_response(response.content, content_type, final_url):
                 filename = final_url.rsplit("/", 1)[-1] or "PDF Notice"
                 candidates[final_url] = {
                     "url": final_url, "title": clean_text(filename, 300),
                     "context": "Direct PDF notice", "source_page": page,
-                    "is_pdf": True, "score": 2, "upload_date": None,
+                    "is_pdf": True, "score": 3, "upload_date": None,
                 }
                 successful_pages += 1
                 continue
+
             if content_type and "html" not in content_type and "xhtml" not in content_type:
                 continue
             if _is_empty_page_text(response.text):
@@ -832,7 +1129,8 @@ def _extract_pdf_text_plumber(content):
 
 
 def _extract_pdf_text_ocr(content):
-    """Tesseract OCR fallback."""
+    if not OCR_ENABLED:
+        return ""
     parts = []
     try:
         images = convert_from_bytes(
@@ -854,11 +1152,15 @@ def _extract_pdf_text_ocr(content):
 
 
 def _extract_with_gemini_pdf(pdf_bytes):
-    """
-    Send PDF directly to Gemini (native PDF support).
-    Tries all 3 fallback models. Returns text or empty string.
-    """
     if not GEMINI_PDF_OCR_ENABLED or not _GEMINI_API_KEY:
+        return ""
+
+    if len(pdf_bytes) > MAX_GEMINI_PDF_BYTES:
+        print(
+            f"[INFO] PDF too large for Gemini ({len(pdf_bytes)} bytes > "
+            f"{MAX_GEMINI_PDF_BYTES}), skipping Gemini",
+            file=sys.stderr,
+        )
         return ""
 
     try:
@@ -927,19 +1229,27 @@ def _text_looks_thin(text):
     stripped = (text or "").strip()
     if len(stripped) < OCR_MIN_TEXT_CHARS:
         return True
+
+    words = re.findall(r"\w+", stripped, re.UNICODE)
+    if len(words) < 20:
+        return True
+
     if not re.search(r"\d", stripped):
         return True
+
     if stripped.count("\n") < 3:
         return True
+
+    char_counts = Counter(stripped.lower())
+    if char_counts:
+        most_common_count = char_counts.most_common(1)[0][1]
+        if most_common_count > len(stripped) * 0.5:
+            return True
+
     return False
 
 
 def download_pdf_content(pdf_url, timeout=30):
-    """
-    Download PDF once. Returns (content_bytes, text, ocr_used, method).
-    OCR chain: pdfplumber → Gemini PDF → Tesseract.
-    Uses runtime cache to avoid re-download.
-    """
     global _RUNTIME_PDF_CACHE
 
     if pdf_url in _RUNTIME_PDF_CACHE:
@@ -947,31 +1257,23 @@ def download_pdf_content(pdf_url, timeout=30):
     else:
         try:
             session = make_session()
-            try:
-                head = session.head(pdf_url, timeout=10, allow_redirects=True)
-                cl = head.headers.get("content-length")
-                if cl:
-                    try:
-                        if int(cl) > MAX_PDF_SEND_BYTES:
-                            return None, "", False, "size_limit"
-                    except (TypeError, ValueError):
-                        pass
-            except Exception:
-                pass
+            content, actual_url, method = _download_with_pdf_resolution(session, pdf_url, timeout)
 
-            response = session.get(pdf_url, timeout=timeout)
-            if response.status_code >= 400:
-                return None, "", False, "http_error"
-            content = response.content
-            if not content or len(content) > MAX_PDF_SEND_BYTES:
+            if not content:
+                return None, "", False, method
+
+            if len(content) > MAX_PDF_SEND_BYTES:
                 return None, "", False, "size_limit"
-            _RUNTIME_PDF_CACHE[pdf_url] = content
+
+            _cache_put(pdf_url, content)
+            if actual_url and actual_url != pdf_url:
+                _cache_put(actual_url, content)
         except Exception as exc:
             print(f"[WARN] PDF download failed for {pdf_url}: {exc}", file=sys.stderr)
             return None, "", False, "download_error"
 
     text = _extract_pdf_text_plumber(content)
-    method = "plumber"
+    extraction_method = "plumber"
 
     if _text_looks_thin(text):
         print(f"[INFO] PDF thin ({len(text)} chars). Trying Gemini PDF OCR...", file=sys.stderr)
@@ -982,7 +1284,7 @@ def download_pdf_content(pdf_url, timeout=30):
                 f"{text}\n\n--- GEMINI OCR ---\n\n{gemini_text}"
                 if text.strip() else gemini_text
             )
-            method = "gemini"
+            extraction_method = "gemini"
             print(f"[INFO] Gemini OCR succeeded ({len(gemini_text)} chars)", file=sys.stderr)
         else:
             print("[INFO] Gemini failed. Trying Tesseract...", file=sys.stderr)
@@ -992,7 +1294,7 @@ def download_pdf_content(pdf_url, timeout=30):
                     f"{text}\n\n--- TESSERACT OCR ---\n\n{tess_text}"
                     if text.strip() else tess_text
                 )
-                method = "tesseract"
+                extraction_method = "tesseract"
                 print(f"[INFO] Tesseract OCR succeeded ({len(tess_text)} chars)", file=sys.stderr)
             else:
                 print("[WARN] All OCR methods failed", file=sys.stderr)
@@ -1000,8 +1302,8 @@ def download_pdf_content(pdf_url, timeout=30):
     return (
         content,
         clean_text(text, MAX_PDF_TEXT_CHARS),
-        method != "plumber",
-        method,
+        extraction_method != "plumber",
+        extraction_method,
     )
 
 
@@ -1043,6 +1345,7 @@ def keyword_fallback(items):
         result[str(index)] = {
             "important": important, "category": category,
             "summary": clean_text(item.get("title", ""), 180),
+            "title_hi": None,
         }
     return result
 
@@ -1071,7 +1374,12 @@ def _build_prompt(prompt_items):
         "'admission', 'counselling', 'scholarship', 'exam_schedule', "
         "'tender', 'gazette', 'land_revenue', 'press_release', "
         "'announcement', 'publication', 'notice', 'other'\n"
-        "3. summary — 1-line summary (<= 150 chars)\n\n"
+        "3. summary — 1-line summary (<= 150 chars)\n"
+        "4. title_hi — Hindi (Devanagari) translation of the title. "
+        "If the title is already in Hindi, set title_hi to the same title. "
+        "If the title is in English, translate to Hindi. "
+        "Do NOT translate proper names/abbreviations/numbers. "
+        "Keep it short (<= 200 chars).\n\n"
 
         "IMPORTANT: If 'pdf_text' is provided, treat it as PRIMARY source. "
         "The text may come from OCR (scanned PDF) and could have minor errors. "
@@ -1169,7 +1477,7 @@ def _build_prompt(prompt_items):
 
         "Schema:\n"
         '{"items":[{'
-        '"id":"0","important":true,"category":"vacancy","summary":"...",'
+        '"id":"0","important":true,"category":"vacancy","summary":"...","title_hi":"...",'
         '"reference_number":null,"issuing_authority":null,"issuing_date":null,'
         '"contact_person":null,"contact_number":null,"email":null,'
         '"helpline_number":null,"official_address":null,"important_instructions":null,'
@@ -1315,6 +1623,7 @@ def _parse_gemini_response(text, item_count):
             "important": bool(row.get("important", False)),
             "category": clean_text(str(row.get("category", "notice")), 40) or "notice",
             "summary": clean_text(str(row.get("summary", "")), 200),
+            "title_hi": _str(row, "title_hi", 200),
             "reference_number": _str(row, "reference_number", 100),
             "issuing_authority": _str(row, "issuing_authority", 200),
             "issuing_date": _str(row, "issuing_date", 80),
@@ -1681,20 +1990,65 @@ def send_telegram_document(token, chat_id, pdf_bytes, filename, caption=""):
 
 
 def _safe_filename(url, default="notice.pdf"):
+    """Generate clean filename from URL slug."""
     try:
-        name = url.rsplit("/", 1)[-1].split("?")[0]
+        parsed = urlparse(url)
+        name = parsed.path.rsplit("/", 1)[-1]
         if name and name.lower().endswith(".pdf"):
-            return name[:100]
+            cleaned = unquote(name)
+            cleaned = re.sub(r"[^\w\u0900-\u097F\-.]", "_", cleaned)
+            return cleaned[:100]
+        path = unquote(parsed.path or "").rstrip("/")
+        slug = path.rsplit("/", 1)[-1]
+        slug = re.sub(r"^(notice|document|page|post)[-_/]", "", slug, flags=re.I)
+        slug = re.sub(r"[^\w\u0900-\u097F\-]", "_", slug)
+        slug = re.sub(r"_+", "_", slug).strip("_")
+        if slug and len(slug) >= 5:
+            return f"{slug[:80]}.pdf"
     except Exception:
         pass
     return default
 
 
+def _build_pdf_caption(full_message, classification):
+    """Build PDF caption with priority fields up top."""
+    if not classification:
+        return full_message[:TELEGRAM_CAPTION_LIMIT]
+
+    priority_keys = [
+        ("last_date", "Last Date"),
+        ("submission_last_date", "Submission Last"),
+        ("application_start_date", "App Starts"),
+        ("apply_start_date", "App Starts"),
+        ("exam_date", "Exam Date"),
+        ("result_date", "Result Date"),
+        ("total_posts", "Total Posts"),
+        ("application_fee", "Fee"),
+        ("pay_scale", "Pay"),
+    ]
+
+    parts = []
+    for k, label in priority_keys:
+        v = classification.get(k)
+        if v:
+            parts.append(f"• {label}: {v}")
+
+    priority_block = ""
+    if parts:
+        priority_block = "\n\n━━━\n" + "\n".join(parts[:6])
+
+    available = TELEGRAM_CAPTION_LIMIT - len(priority_block)
+
+    if available > 200:
+        caption = full_message[:available]
+        last_nl = caption.rfind("\n")
+        if last_nl > available * 0.7:
+            caption = caption[:last_nl]
+        return caption.rstrip() + priority_block
+    return full_message[:TELEGRAM_CAPTION_LIMIT]
+
+
 def send_notification_with_pdf(token, chat_id, record, full_message):
-    """
-    Send PDF document with caption. SINGLE MESSAGE ONLY.
-    Uses runtime cache to avoid re-download.
-    """
     pdf_url = record.get("url", "")
     filename = _safe_filename(pdf_url)
 
@@ -1703,32 +2057,24 @@ def send_notification_with_pdf(token, chat_id, record, full_message):
     if pdf_bytes is None:
         try:
             session = make_session()
-            try:
-                head = session.head(pdf_url, timeout=10, allow_redirects=True)
-                cl = head.headers.get("content-length")
-                if cl:
-                    try:
-                        if int(cl) > MAX_PDF_SEND_BYTES:
-                            return send_telegram(token, chat_id, truncate_telegram(full_message))
-                    except (TypeError, ValueError):
-                        pass
-            except Exception:
-                pass
-
-            response = session.get(pdf_url, timeout=30)
-            if response.status_code == 200:
-                content = response.content
-                content_type = response.headers.get("content-type", "").lower()
-                if (is_pdf(pdf_url) or "application/pdf" in content_type) and len(content) <= MAX_PDF_SEND_BYTES:
-                    pdf_bytes = content
-                    _RUNTIME_PDF_CACHE[pdf_url] = content
+            content, actual_url, method = _download_with_pdf_resolution(
+                session, pdf_url, 30
+            )
+            if content and len(content) <= MAX_PDF_SEND_BYTES:
+                pdf_bytes = content
+                _cache_put(pdf_url, content)
+                if actual_url and actual_url != pdf_url:
+                    _cache_put(actual_url, content)
+                    new_name = _safe_filename(actual_url)
+                    if new_name and new_name != "notice.pdf":
+                        filename = new_name
         except Exception as exc:
             print(f"[WARN] PDF download for send failed: {exc}", file=sys.stderr)
 
     if not pdf_bytes:
         return send_telegram(token, chat_id, truncate_telegram(full_message))
 
-    caption = full_message
+    caption = _build_pdf_caption(full_message, record.get("classification"))
     if len(caption) > TELEGRAM_CAPTION_LIMIT:
         caption = caption[:TELEGRAM_CAPTION_LIMIT]
         last_nl = caption.rfind("\n")
@@ -1757,6 +2103,13 @@ def _safe_str(value, limit=300):
         return None
     text = clean_text(str(value), limit)
     return text or None
+
+
+def _is_devanagari(s):
+    if not s:
+        return False
+    dev_count = sum(1 for c in s if "\u0900" <= c <= "\u097F")
+    return dev_count > len(s) * 0.3
 
 
 _LABELS_HI = {
@@ -2344,15 +2697,21 @@ def format_message(site, item, classification=None):
     classification = classification or {}
     raw_title = clean_text(item.get("title", "Notification"), 300)
     if _is_language_selector(raw_title):
-        raw_title = clean_text(item.get("context", ""), 200) or "Notification"
-    title = html.escape(raw_title)
+        raw_title = (
+            clean_text(item.get("context", ""), 200)
+            or _title_from_url(item.get("url", ""))
+            or "Notification"
+        )
+
+    title_hi = _safe_str(classification.get("title_hi"), 200)
+    title_is_hindi = _is_devanagari(raw_title)
+
     site_name = html.escape(site["name"])
     url = html.escape(item["url"], quote=True)
     summary = html.escape(_safe_str(classification.get("summary")) or "")
     category = (classification.get("category") or "notice").lower()
     emoji = CATEGORY_EMOJI.get(category, "📌")
 
-    # OCR method marker
     ocr_method = item.get("pdf_method", "")
     if ocr_method == "gemini":
         ocr_marker = " 🔍G"
@@ -2363,7 +2722,14 @@ def format_message(site, item, classification=None):
 
     pdf_marker = " 📄" if item.get("is_pdf") else ""
 
-    lines = [f"🔔 <b>{site_name}</b>{pdf_marker}", "", f"<b>{title}</b>{ocr_marker}", ""]
+    lines = [f"🔔 <b>{site_name}</b>{pdf_marker}", ""]
+
+    lines.append(f"<b>{html.escape(raw_title)}</b>{ocr_marker}")
+    if not title_is_hindi and title_hi and title_hi.strip().lower() != raw_title.strip().lower():
+        if NOTIFY_LANGUAGE in ("both", "hi"):
+            lines.append(f"<i>{html.escape(title_hi)}</i>")
+
+    lines.append("")
     if summary:
         lines.append(summary)
         lines.append("")
@@ -2429,14 +2795,46 @@ def refresh_stats(state):
 # Main
 # ---------------------------------------------------------------------------
 
+def _should_fetch_pdf(record):
+    """
+    Broaden: try PDF fetch for ANY non-listing URL.
+    Magic bytes will confirm whether it's a PDF.
+    """
+    if record.get("pdf_extracted") or record.get("pdf_text"):
+        return False
+    if int(record.get("pdf_attempts", 0)) >= MAX_PDF_ATTEMPTS:
+        return False
+
+    url = record.get("url", "")
+    url_lower = url.lower()
+
+    # Only real listing/archive pages skip
+    if any(pat in url_lower for pat in (
+        "/past-notices", "/past_notices",
+        "/whats-new", "/whats_new",
+        "/notice_category", "/notice-category",
+        "/document-category", "/document_category",
+        "/archive", "/search",
+    )):
+        return False
+
+    # Home page skip
+    try:
+        parsed = urlparse(url)
+        if parsed.path in ("", "/"):
+            return False
+    except Exception:
+        pass
+
+    # Try everything else
+    return True
+
+
 def _fetch_pdfs_for_batch(batch, scan):
     targets = [
         (iid, record)
         for iid, record in batch
-        if record.get("is_pdf")
-        and not record.get("pdf_extracted")
-        and not record.get("pdf_text")
-        and int(record.get("pdf_attempts", 0)) < MAX_PDF_ATTEMPTS
+        if _should_fetch_pdf(record)
     ]
     if not targets:
         return
@@ -2494,7 +2892,6 @@ def main():
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
 
-    # Set global for OCR functions
     _GEMINI_API_KEY = gemini_key
 
     if not token or not chat_id or not gemini_key:
@@ -2574,6 +2971,14 @@ def main():
             iid = item_id(sid, candidate["url"], candidate["title"], candidate.get("context", ""))
             record = state["items"].get(iid)
 
+            url_lower = candidate["url"].lower()
+            is_pdf_or_notice = (
+                bool(candidate.get("is_pdf"))
+                or _looks_like_pdf_url(candidate["url"])
+                or "/notice/" in url_lower
+                or "/document" in url_lower
+            )
+
             if record is None:
                 fuzzy_iid = find_fuzzy_match(site_items_list, candidate["title"], candidate["url"])
                 if fuzzy_iid and fuzzy_iid in state["items"]:
@@ -2589,7 +2994,7 @@ def main():
                         "site_id": sid, "site_name": site["name"],
                         "url": candidate["url"], "title": candidate["title"],
                         "context": candidate.get("context", "")[:700],
-                        "is_pdf": bool(candidate.get("is_pdf")),
+                        "is_pdf": is_pdf_or_notice,
                         "first_seen": utc_now(), "last_seen": utc_now(),
                         "status": "baseline", "attempts": 0, "summary": "",
                         "classification": None, "pdf_extracted": False,
@@ -2605,7 +3010,7 @@ def main():
                     "site_id": sid, "site_name": site["name"],
                     "url": candidate["url"], "title": candidate["title"],
                     "context": candidate.get("context", "")[:700],
-                    "is_pdf": bool(candidate.get("is_pdf")),
+                    "is_pdf": is_pdf_or_notice,
                     "first_seen": utc_now(), "last_seen": utc_now(),
                     "status": "pending", "attempts": 0, "summary": "",
                     "classification": None, "pdf_extracted": False,
@@ -2624,7 +3029,9 @@ def main():
                     record["context"] = candidate["context"][:700]
                 if candidate.get("upload_date"):
                     record["upload_date"] = candidate["upload_date"]
-                record["is_pdf"] = bool(candidate.get("is_pdf", record.get("is_pdf", False)))
+                record["is_pdf"] = bool(
+                    candidate.get("is_pdf", record.get("is_pdf", False))
+                ) or is_pdf_or_notice
 
             if (
                 ss["baseline_complete"]
