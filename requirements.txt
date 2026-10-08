@@ -5,3 +5,4 @@ pdfplumber>=0.11,<1
 rapidfuzz>=3.9,<4
 pdf2image>=1.17,<2
 pytesseract>=0.3.10,<1
+Pillow>=10.0,<12
