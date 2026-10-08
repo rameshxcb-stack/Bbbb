@@ -29,14 +29,15 @@ jobs:
           python-version: "3.12"
           cache: "pip"
 
-      - name: Install system deps (OCR)
+      - name: Install system deps (Tesseract + Poppler)
         run: |
           sudo apt-get update
           sudo apt-get install -y tesseract-ocr tesseract-ocr-hin poppler-utils
 
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: |
-          python -m pip install -r requirements.txt
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Run notification monitor
         env:
@@ -44,12 +45,13 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           NOTIFY_LANGUAGE: "both"
-          # OCR settings — safe defaults
           OCR_ENABLED: "true"
-          OCR_LANG: "eng"
-          OCR_MAX_WORKERS: "1"
+          OCR_LANG: "eng+hin"
           OCR_DPI: "200"
+          OCR_MAX_WORKERS: "1"
+          SEND_PDF_ENABLED: "true"
           GEMINI_MAX_OUTPUT_TOKENS: "16384"
+          GEMINI_PDF_OCR_ENABLED: "true"
         run: |
           python monitor.py
 
@@ -60,7 +62,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add state.json
           git diff --cached --quiet || \
-            git commit -m "chore: update notification monitor state"
+            git commit -m "chore: update notification state"
 
       - name: Rebase and push state
         if: always()
