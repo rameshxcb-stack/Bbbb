@@ -2,7 +2,7 @@ name: Jharkhand District Notification Monitor
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/20 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -29,11 +29,6 @@ jobs:
           python-version: "3.12"
           cache: "pip"
 
-      - name: Install system deps (Tesseract + Poppler)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y tesseract-ocr tesseract-ocr-hin poppler-utils
-
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
@@ -46,12 +41,12 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           NOTIFY_LANGUAGE: "both"
           OCR_ENABLED: "true"
-          OCR_LANG: "eng+hin"
-          OCR_DPI: "200"
-          OCR_MAX_WORKERS: "1"
+          OCR_DPI: "150"
+          OCR_MAX_WORKERS: "2"
           SEND_PDF_ENABLED: "true"
           GEMINI_MAX_OUTPUT_TOKENS: "16384"
           GEMINI_PDF_OCR_ENABLED: "true"
+          STALE_NOTICE_DAYS: "10"
         run: |
           python monitor.py
 
