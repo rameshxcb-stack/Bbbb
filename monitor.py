@@ -15,23 +15,31 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse, urlunparse, unquote
 
 import pdfplumber
-import pytesseract
 import requests
 from bs4 import BeautifulSoup
-from pdf2image import convert_from_bytes
 from rapidfuzz import fuzz
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+# ⭐ RapidOCR — replaces Tesseract
+try:
+    from rapidocr_onnxruntime import RapidOCR
+    import fitz  # PyMuPDF — PDF → image conversion
+    _RAPIDOCR_AVAILABLE = True
+except ImportError:
+    RapidOCR = None
+    fitz = None
+    _RAPIDOCR_AVAILABLE = False
 
 
 BASE = Path(__file__).resolve().parent
 CONFIG_FILE = BASE / "websites.json"
 STATE_FILE = BASE / "state.json"
 
+# Ultimate fallback if discovery fails
 FALLBACK_MODELS = [
     "gemini-3.5-flash-lite",
-    "gemini-2.5-flash-lite",
-    "gemini-2.0-flash-lite",
+    "gemini-3.1-flash-lite",
 ]
 
 FUZZY_DUPLICATE_THRESHOLD = 97
@@ -48,11 +56,12 @@ _RUNTIME_PDF_CACHE_MAX_ITEMS = 50
 
 GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "16384"))
 
+# ⭐ OCR (RapidOCR) settings
 OCR_ENABLED = os.getenv("OCR_ENABLED", "true").strip().lower() == "true"
-OCR_DPI = int(os.getenv("OCR_DPI", "200"))
-OCR_LANG = os.getenv("OCR_LANG", "eng+hin")
+OCR_DPI = int(os.getenv("OCR_DPI", "150"))
 OCR_MIN_TEXT_CHARS = int(os.getenv("OCR_MIN_TEXT_CHARS", "200"))
-OCR_MAX_WORKERS = int(os.getenv("OCR_MAX_WORKERS", "1"))
+OCR_MAX_WORKERS = int(os.getenv("OCR_MAX_WORKERS", "2"))
+_OCR_MAX_PAGES = int(os.getenv("OCR_MAX_PAGES", "4"))
 
 GEMINI_PDF_OCR_ENABLED = os.getenv("GEMINI_PDF_OCR_ENABLED", "true").strip().lower() == "true"
 
@@ -62,12 +71,11 @@ NOTIFY_LANGUAGE = os.getenv("NOTIFY_LANGUAGE", "both").strip().lower()
 if NOTIFY_LANGUAGE not in {"both", "hi", "en"}:
     NOTIFY_LANGUAGE = "both"
 
-# ⭐ CHANGE #1: Default 30 → 10
 STALE_NOTICE_DAYS = int(os.getenv("STALE_NOTICE_DAYS", "10"))
 
 USER_AGENT = os.getenv(
     "MONITOR_USER_AGENT",
-    "Mozilla/5.0 (compatible; JharkhandNoticeMonitor/7.2)"
+    "Mozilla/5.0 (compatible; JharkhandNoticeMonitor/9.0)"
 )
 
 STRONG_KEYWORDS = [
@@ -82,6 +90,27 @@ STRONG_KEYWORDS = [
 _RUNTIME_PDF_CACHE: Dict[str, bytes] = {}
 _GEMINI_API_KEY = ""
 
+# ⭐ Dynamic model state
+_MODELS_DISCOVERED: bool = False
+_DYNAMIC_MODELS: List[str] = []
+_DEAD_MODELS: set = set()
+_GEMINI_QUOTA_EXHAUSTED: bool = False
+
+# Lazy-loaded RapidOCR instance
+_RAPIDOCR_INSTANCE = None
+
+
+def _get_rapidocr():
+    """Lazy init RapidOCR (heavy model load)."""
+    global _RAPIDOCR_INSTANCE
+    if _RAPIDOCR_INSTANCE is None and _RAPIDOCR_AVAILABLE:
+        try:
+            _RAPIDOCR_INSTANCE = RapidOCR()
+        except Exception as exc:
+            print(f"[WARN] RapidOCR init failed: {exc}", file=sys.stderr)
+            return None
+    return _RAPIDOCR_INSTANCE
+
 
 def _cache_put(url, content):
     if url in _RUNTIME_PDF_CACHE:
@@ -93,6 +122,60 @@ def _cache_put(url, content):
         except (StopIteration, KeyError):
             pass
     _RUNTIME_PDF_CACHE[url] = content
+
+
+def _discover_models():
+    """Dynamically fetch available Gemini models from API."""
+    global _MODELS_DISCOVERED, _DYNAMIC_MODELS
+
+    if _MODELS_DISCOVERED:
+        return
+
+    print("[INFO] Discovering available Gemini models...", file=sys.stderr)
+
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={_GEMINI_API_KEY}"
+        response = requests.get(url, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+
+        valid_models = []
+        for model in data.get("models", []):
+            methods = model.get("supportedGenerationMethods", [])
+            if "generateContent" not in methods:
+                continue
+            model_id = model["name"].replace("models/", "")
+            if any(skip in model_id.lower() for skip in ("embedding", "aqa", "imagen", "veo")):
+                continue
+            valid_models.append(model_id)
+
+        def _priority(mid):
+            m = mid.lower()
+            if "flash-lite" in m:
+                return 0
+            if "flash" in m:
+                return 1
+            if "pro" in m:
+                return 2
+            return 3
+
+        _DYNAMIC_MODELS = sorted(valid_models, key=lambda m: (_priority(m), m))
+
+        if _DYNAMIC_MODELS:
+            print(
+                f"[INFO] Discovered {len(_DYNAMIC_MODELS)} models. "
+                f"Top 3: {_DYNAMIC_MODELS[:3]}",
+                file=sys.stderr,
+            )
+        else:
+            print("[WARN] No models found. Using hardcoded fallback.", file=sys.stderr)
+            _DYNAMIC_MODELS = list(FALLBACK_MODELS)
+
+    except Exception as exc:
+        print(f"[WARN] Model discovery failed: {exc}. Using fallback.", file=sys.stderr)
+        _DYNAMIC_MODELS = list(FALLBACK_MODELS)
+
+    _MODELS_DISCOVERED = True
 
 
 # ---------------------------------------------------------------------------
@@ -138,10 +221,6 @@ def _looks_like_pdf_response(content, content_type, url=""):
 
 
 def _collect_all_pdf_candidates(html_text, base_url, max_candidates=15):
-    """
-    HTML se SAARE possible PDF candidates collect karo, priority ke saath.
-    Content-based approach — kisi bhi pattern/text/URL pe depend nahi.
-    """
     if not html_text:
         return []
     try:
@@ -182,13 +261,11 @@ def _collect_all_pdf_candidates(html_text, base_url, max_candidates=15):
         if candidates.get(abs_url, 0) < priority:
             candidates[abs_url] = priority
 
-    # TIER 1 (100): iframe / embed / object / source
     for tag in soup.find_all(["iframe", "embed", "object", "source"]):
         src = tag.get("src") or tag.get("data") or ""
         if src and not src.lower().startswith(("javascript:", "#", "data:")):
             _add(src, 100)
 
-    # TIER 2 (95): onclick handlers
     for tag in soup.find_all(onclick=True):
         onclick = tag.get("onclick", "") or ""
         for pat in (
@@ -201,13 +278,11 @@ def _collect_all_pdf_candidates(html_text, base_url, max_candidates=15):
             if m:
                 _add(m.group(1), 95)
 
-    # TIER 3 (90): <a href=".pdf">
     for a in soup.find_all("a", href=True):
         href = a.get("href", "")
         if ".pdf" in href.lower() or _looks_like_pdf_url(href):
             _add(href, 90)
 
-    # TIER 4 (80): file-serving path hints
     _PDF_PATH_HINTS = (
         "/writereaddata/", "/uploadfile/", "/uploads/", "/upload/",
         "/downloadfile/", "/download_file/", "/getfile/", "/showfile/",
@@ -221,7 +296,6 @@ def _collect_all_pdf_candidates(html_text, base_url, max_candidates=15):
         if any(hint in href_lower for hint in _PDF_PATH_HINTS):
             _add(href, 80)
 
-    # TIER 5 (70/75): text-based keywords
     _TEXT_KEYWORDS = (
         "view", "download", "click here", "click", "open", "get",
         "see file", "show", "read", "attachment", "file", "link",
@@ -239,7 +313,6 @@ def _collect_all_pdf_candidates(html_text, base_url, max_candidates=15):
                 priority = 75
             _add(href, priority)
 
-    # TIER 6 (65): icon-only links
     for a in soup.find_all("a", href=True):
         href = a.get("href", "")
         img = a.find("img")
@@ -254,7 +327,6 @@ def _collect_all_pdf_candidates(html_text, base_url, max_candidates=15):
         if any(kw in img_attrs for kw in ("pdf", "document", "file", "download", "attachment", "doc")):
             _add(href, 65)
 
-    # TIER 7 (60): near "File:" / "फ़ाइल:" label
     _FILE_LABEL_RE = re.compile(
         r"^(file|फ़ाइल|फाइल|attachment|संलग्नक|file\s*name|फ़ाइल\s*नाम)\s*[:\-]?\s*$",
         re.I,
@@ -269,11 +341,9 @@ def _collect_all_pdf_candidates(html_text, base_url, max_candidates=15):
         for a in parent.find_all("a", href=True):
             _add(a.get("href", ""), 60)
 
-    # TIER 8 (50): target="_blank" links
     for a in soup.find_all("a", href=True, target="_blank"):
         _add(a.get("href", ""), 50)
 
-    # TIER 9 (30): FALLBACK — ALL remaining non-nav links
     for a in soup.find_all("a", href=True):
         href = a.get("href", "")
         _add(href, 30)
@@ -541,10 +611,6 @@ _UPLOAD_DATE_TEXT_PATTERNS = [
 
 
 def _extract_upload_date(anchor_tag):
-    """
-    ⭐ CHANGE #5: 'ds[0]' (pehli date) → 'max(ds)' (latest date).
-    NIC sites often list reference (old) date + publish (new) date.
-    """
     try:
         search_root = (
             anchor_tag.find_parent("tr")
@@ -569,24 +635,20 @@ def _extract_upload_date(anchor_tag):
                     pass
                 ds = _extract_full_dates(raw)
                 if ds:
-                    return max(ds)              # ⭐ LATEST
+                    return max(ds)
         text = search_root.get_text(" ", strip=True)
         for pat in _UPLOAD_DATE_TEXT_PATTERNS:
             m = pat.search(text)
             if m:
                 ds = _extract_full_dates(m.group(1))
                 if ds:
-                    return max(ds)              # ⭐ LATEST
+                    return max(ds)
     except Exception:
         pass
     return None
 
 
 def _is_stale_notice(title, context, url, upload_date=None):
-    """
-    ⭐ CHANGE #6: Combine upload_date + context dates, use LATEST.
-    Handles: reference date 2020 + publish date 2026 → picks 2026.
-    """
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=STALE_NOTICE_DAYS)
 
@@ -601,7 +663,7 @@ def _is_stale_notice(title, context, url, upload_date=None):
     candidate_dates.extend(_extract_full_dates(haystack))
 
     if not candidate_dates:
-        return False  # no dates → keep
+        return False
 
     past_dates = [d for d in candidate_dates if d <= now]
     if not past_dates:
@@ -761,7 +823,7 @@ def get_config():
 
 def default_state():
     return {
-        "version": 20,
+        "version": 21,
         "initialized": False,
         "last_run": None,
         "items": {},
@@ -806,7 +868,7 @@ def load_state():
         record.setdefault("upload_date", None)
         record.setdefault("first_seen", utc_now())
         record.setdefault("last_seen", record["first_seen"])
-    state["version"] = 20
+    state["version"] = 21
     return state
 
 
@@ -965,7 +1027,7 @@ def extract_candidates(html_text, page_url, site, scan):
         )):
             pdf_bonus = 1
         else:
-            pdf_bonus = 1  # fallback: try
+            pdf_bonus = 1
 
         if score <= 0 and pdf_bonus == 0:
             continue
@@ -1095,7 +1157,7 @@ def scan_site(site, scan):
 
 
 # ---------------------------------------------------------------------------
-# PDF extraction (text + tables + OCR)
+# PDF extraction — plumber → Gemini → RapidOCR
 # ---------------------------------------------------------------------------
 
 def _extract_pdf_text_plumber(content):
@@ -1123,38 +1185,51 @@ def _extract_pdf_text_plumber(content):
     return "\n".join(parts)
 
 
-def _extract_pdf_text_ocr(content):
-    if not OCR_ENABLED:
+def _extract_pdf_text_rapidocr(content):
+    """⭐ RapidOCR — Tesseract replacement. Fast, accurate, free, lightweight."""
+    if not OCR_ENABLED or not _RAPIDOCR_AVAILABLE:
         return ""
+
+    ocr = _get_rapidocr()
+    if ocr is None:
+        return ""
+
     parts = []
     try:
-        images = convert_from_bytes(
-            content,
-            first_page=1,
-            last_page=MAX_PDF_PAGES,
-            dpi=OCR_DPI,
-        )
-        for idx, img in enumerate(images):
+        doc = fitz.open(stream=content, filetype="pdf")
+        pages_to_process = min(len(doc), MAX_PDF_PAGES, _OCR_MAX_PAGES)
+
+        for page_num in range(pages_to_process):
             try:
-                txt = pytesseract.image_to_string(img, lang=OCR_LANG) or ""
-                if txt.strip():
-                    parts.append(txt)
+                page = doc.load_page(page_num)
+                pix = page.get_pixmap(dpi=OCR_DPI)
+                img_bytes = pix.tobytes("png")
+
+                result, _ = ocr(img_bytes)
+                if result:
+                    # result format: [[box, text, confidence], ...]
+                    page_lines = [line[1] for line in result if len(line) > 1]
+                    if page_lines:
+                        parts.append("\n".join(page_lines))
             except Exception as exc:
-                print(f"[WARN] Tesseract page {idx+1} failed: {exc}", file=sys.stderr)
+                print(f"[WARN] RapidOCR page {page_num+1} failed: {exc}", file=sys.stderr)
+
+        doc.close()
     except Exception as exc:
-        print(f"[WARN] Tesseract conversion failed: {exc}", file=sys.stderr)
+        print(f"[WARN] RapidOCR PDF processing failed: {exc}", file=sys.stderr)
+
     return "\n".join(parts)
 
 
 def _extract_with_gemini_pdf(pdf_bytes):
-    """
-    ⭐ CHANGE #2-4:
-    - timeout 60 → 180
-    - maxOutputTokens 8192 → 16384
-    - 4xx errors logged
-    - 2 attempts per model (timeout pe retry)
-    """
+    """Gemini PDF OCR with dynamic models + quota tracking."""
+    global _GEMINI_QUOTA_EXHAUSTED
+
     if not GEMINI_PDF_OCR_ENABLED or not _GEMINI_API_KEY:
+        return ""
+
+    # Quota exhausted → skip Gemini entirely (RapidOCR will handle)
+    if _GEMINI_QUOTA_EXHAUSTED:
         return ""
 
     if len(pdf_bytes) > MAX_GEMINI_PDF_BYTES:
@@ -1187,7 +1262,7 @@ def _extract_with_gemini_pdf(pdf_bytes):
             }],
             "generationConfig": {
                 "temperature": 0.0,
-                "maxOutputTokens": 16384,       # ⭐ 8192 → 16384
+                "maxOutputTokens": 16384,
             },
         }
 
@@ -1196,33 +1271,55 @@ def _extract_with_gemini_pdf(pdf_bytes):
             "Content-Type": "application/json",
         }
 
-        for model in FALLBACK_MODELS:
+        for model in _DYNAMIC_MODELS:
+            if model in _DEAD_MODELS:
+                continue
+
             endpoint = (
                 "https://generativelanguage.googleapis.com/"
                 f"v1beta/models/{model}:generateContent"
             )
-            # ⭐ 2 attempts per model (timeout pe retry)
+
             for attempt in range(2):
                 try:
                     response = requests.post(
                         endpoint, headers=headers,
                         json=payload,
-                        timeout=180,            # ⭐ 60 → 180
+                        timeout=90,
                     )
 
                     if response.status_code == 429:
-                        print(f"[WARN] Gemini 429 rate limit ({model})", file=sys.stderr)
-                        time.sleep(15)
-                        continue
+                        try:
+                            err_data = response.json()
+                            err_msg = str(err_data.get("error", {}).get("message", ""))
+                        except Exception:
+                            err_msg = response.text
+
+                        if "quota" in err_msg.lower() or "exceeded" in err_msg.lower():
+                            _GEMINI_QUOTA_EXHAUSTED = True
+                            print(
+                                f"[QUOTA] Gemini quota exhausted — "
+                                f"switching to RapidOCR for rest of run",
+                                file=sys.stderr,
+                            )
+                            return ""
+                        else:
+                            print(f"[WARN] Gemini 429 short-limit ({model})", file=sys.stderr)
+                            time.sleep(10)
+                            continue
+
+                    if response.status_code == 404:
+                        _DEAD_MODELS.add(model)
+                        print(f"[WARN] Gemini model DEAD ({model})", file=sys.stderr)
+                        break
 
                     if response.status_code >= 400:
-                        # ⭐ Log WHY it failed (was silent before)
                         print(
                             f"[WARN] Gemini {response.status_code} ({model}): "
-                            f"{response.text[:200]}",
+                            f"{response.text[:150]}",
                             file=sys.stderr,
                         )
-                        break  # next model
+                        break
 
                     data = response.json()
                     text = _extract_gemini_text(data)
@@ -1232,15 +1329,23 @@ def _extract_with_gemini_pdf(pdf_bytes):
                             file=sys.stderr,
                         )
                         return text
-                    break  # empty response → next model
 
-                except requests.Timeout:
+                    finish_reason = "unknown"
+                    try:
+                        cands = data.get("candidates") or []
+                        if cands:
+                            finish_reason = cands[0].get("finishReason", "unknown")
+                    except Exception:
+                        pass
                     print(
-                        f"[WARN] Gemini timeout ({model}), attempt {attempt+1}/2",
+                        f"[WARN] Gemini empty ({model}), finishReason={finish_reason}",
                         file=sys.stderr,
                     )
-                    continue  # retry same model
+                    break
 
+                except requests.Timeout:
+                    print(f"[WARN] Gemini timeout ({model}), attempt {attempt+1}/2", file=sys.stderr)
+                    continue
                 except Exception as exc:
                     print(f"[WARN] Gemini error ({model}): {exc}", file=sys.stderr)
                     break
@@ -1313,17 +1418,20 @@ def download_pdf_content(pdf_url, timeout=30):
             extraction_method = "gemini"
             print(f"[INFO] Gemini OCR succeeded ({len(gemini_text)} chars)", file=sys.stderr)
         else:
-            print("[INFO] Gemini failed. Trying Tesseract...", file=sys.stderr)
-            tess_text = _extract_pdf_text_ocr(content)
-            if tess_text and len(tess_text.strip()) > len(text.strip()):
-                text = (
-                    f"{text}\n\n--- TESSERACT OCR ---\n\n{tess_text}"
-                    if text.strip() else tess_text
-                )
-                extraction_method = "tesseract"
-                print(f"[INFO] Tesseract OCR succeeded ({len(tess_text)} chars)", file=sys.stderr)
+            if OCR_ENABLED and _RAPIDOCR_AVAILABLE:
+                print("[INFO] Gemini failed/skipped. Trying RapidOCR...", file=sys.stderr)
+                rocr_text = _extract_pdf_text_rapidocr(content)
+                if rocr_text and len(rocr_text.strip()) > len(text.strip()):
+                    text = (
+                        f"{text}\n\n--- RAPIDOCR ---\n\n{rocr_text}"
+                        if text.strip() else rocr_text
+                    )
+                    extraction_method = "rapidocr"
+                    print(f"[INFO] RapidOCR succeeded ({len(rocr_text)} chars)", file=sys.stderr)
+                else:
+                    print("[WARN] All OCR methods failed", file=sys.stderr)
             else:
-                print("[WARN] All OCR methods failed", file=sys.stderr)
+                print("[INFO] RapidOCR disabled or unavailable", file=sys.stderr)
 
     return (
         content,
@@ -1895,6 +2003,9 @@ def gemini_classify(items, api_key, model, timeout):
                     time.sleep(min(10, 2 ** attempt))
                     continue
                 raise RuntimeError(last_error)
+            if response.status_code == 404:
+                _DEAD_MODELS.add(model)
+                raise RuntimeError(f"Gemini model DEAD: {model}")
             if response.status_code >= 400:
                 raise RuntimeError(f"Gemini HTTP {response.status_code}: {clean_text(response.text, 500)}")
             data = response.json()
@@ -1910,18 +2021,30 @@ def gemini_classify(items, api_key, model, timeout):
 
 
 def gemini_classify_with_fallback(items, api_key, timeout):
+    """Dynamic model fallback — uses discovered models, skips dead ones."""
+    global _GEMINI_QUOTA_EXHAUSTED
+
+    if _GEMINI_QUOTA_EXHAUSTED:
+        print("[QUOTA] Gemini quota exhausted — using keyword fallback", file=sys.stderr)
+        return keyword_fallback(items)
+
     seen = []
-    for model in FALLBACK_MODELS:
-        if model in seen:
+    for model in _DYNAMIC_MODELS:
+        if model in seen or model in _DEAD_MODELS:
             continue
         seen.append(model)
         try:
             result = gemini_classify(items, api_key, model, timeout)
             if result:
-                print(f"[INFO] Gemini success with model: {model}")
+                print(f"[INFO] Gemini classify success: {model}")
                 return result
         except Exception as exc:
-            print(f"[WARN] Model {model} failed: {clean_text(str(exc), 200)}", file=sys.stderr)
+            err_str = str(exc)
+            if "quota" in err_str.lower() or "RESOURCE_EXHAUSTED" in err_str:
+                _GEMINI_QUOTA_EXHAUSTED = True
+                print("[QUOTA] Gemini quota exhausted mid-classify", file=sys.stderr)
+                break
+            print(f"[WARN] Classify {model} failed: {clean_text(err_str, 200)}", file=sys.stderr)
             continue
     print("[WARN] All Gemini models failed. Using keyword fallback.", file=sys.stderr)
     return keyword_fallback(items)
@@ -2739,8 +2862,8 @@ def format_message(site, item, classification=None):
     ocr_method = item.get("pdf_method", "")
     if ocr_method == "gemini":
         ocr_marker = " 🔍G"
-    elif ocr_method == "tesseract":
-        ocr_marker = " 🔍T"
+    elif ocr_method == "rapidocr":
+        ocr_marker = " 🔍R"
     else:
         ocr_marker = ""
 
@@ -2894,9 +3017,18 @@ def _parse_upload_date(raw):
 
 
 def main():
-    global STALE_NOTICE_DAYS, _RUNTIME_PDF_CACHE, _GEMINI_API_KEY
+    global STALE_NOTICE_DAYS, _RUNTIME_PDF_CACHE, _GEMINI_API_KEY, _GEMINI_QUOTA_EXHAUSTED
 
     _RUNTIME_PDF_CACHE = {}
+    _DEAD_MODELS.clear()
+    _GEMINI_QUOTA_EXHAUSTED = False
+
+    import time as _time
+    _START_TIME = _time.monotonic()
+    _MAX_RUN_SECONDS = 20 * 60
+
+    def _time_exceeded():
+        return (_time.monotonic() - _START_TIME) > _MAX_RUN_SECONDS
 
     try:
         cfg = get_config()
@@ -2922,6 +3054,8 @@ def main():
     except Exception as exc:
         print(f"[FATAL] Telegram validation failed: {exc}", file=sys.stderr)
         return 2
+
+    _discover_models()
 
     scan = cfg["scan"]
     STALE_NOTICE_DAYS = scan.get("stale_notice_days", STALE_NOTICE_DAYS)
@@ -3041,7 +3175,6 @@ def main():
             else:
                 record["last_seen"] = utc_now()
 
-                # ⭐ CHANGE #7: Baseline title-change detection
                 if record.get("status") == "baseline":
                     old_title = (record.get("title") or "").strip()
                     new_title = (candidate.get("title") or "").strip()
@@ -3079,10 +3212,18 @@ def main():
     pending.sort(key=lambda pair: -local_score(
         pair[1]["title"], pair[1]["url"], pair[1].get("context", ""), scan["keywords"],
     ))
-    pending = pending[: scan["gemini_batch_size"] * scan["gemini_max_calls_per_run"]]
+    max_items_this_run = min(
+        scan["gemini_batch_size"] * scan["gemini_max_calls_per_run"],
+        40,
+    )
+    pending = pending[:max_items_this_run]
 
     batch_size = scan["gemini_batch_size"]
     for start in range(0, len(pending), batch_size):
+        if _time_exceeded():
+            print("[TIME_LIMIT] Exceeded 20 min — stopping Gemini batches early", file=sys.stderr)
+            break
+
         batch = pending[start : start + batch_size]
         try:
             _fetch_pdfs_for_batch(batch, scan)
@@ -3123,6 +3264,10 @@ def main():
 
     sent_count = 0
     for iid, record in ready[: scan["max_new_items_per_run"]]:
+        if _time_exceeded():
+            print("[TIME_LIMIT] Exceeded — stopping Telegram sends early", file=sys.stderr)
+            break
+
         site = next((s for s in cfg["websites"] if s["id"] == record.get("site_id")), None)
         if site is None:
             record["status"] = "permanent_error"
@@ -3156,7 +3301,7 @@ def main():
             run_errors += 1
             print(f"[WARN] Telegram delivery failed; will retry: {detail}", file=sys.stderr)
 
-    # ⭐ CHANGE #8: Health alert — 24h no notices
+    # Health alert
     try:
         if sent_count == 0:
             last_notify_str = state.get("last_successful_notify_at")
@@ -3176,11 +3321,10 @@ def main():
                 alert_msg = (
                     f"⚠️ <b>Monitor Health Alert</b>\n\n"
                     f"Last 24 hours me koi notice nahi mila.\n"
-                    f"Last successful delivery: {last_notify_str or 'unknown'}\n\n"
-                    f"Check kar lo — kuch to gadbad hai."
+                    f"Last successful delivery: {last_notify_str or 'unknown'}"
                 )
                 send_telegram(token, chat_id, alert_msg)
-                print("[ALERT] 24h no notices — health alert sent", file=sys.stderr)
+                print("[ALERT] 24h no notices", file=sys.stderr)
         else:
             state["last_successful_notify_at"] = utc_now()
     except Exception as exc:
@@ -3188,17 +3332,26 @@ def main():
 
     _RUNTIME_PDF_CACHE.clear()
 
-    state["stats"]["errors"] = int(state["stats"].get("errors", 0)) + run_errors
-    refresh_stats(state)
-    prune_state(state, scan["retention_days"])
-    atomic_save_json(STATE_FILE, state)
+    try:
+        state["stats"]["errors"] = int(state["stats"].get("errors", 0)) + run_errors
+        refresh_stats(state)
+        prune_state(state, scan["retention_days"])
+        atomic_save_json(STATE_FILE, state)
+    except Exception as exc:
+        print(f"[FATAL] State save failed: {exc}", file=sys.stderr)
+        try:
+            atomic_save_json(STATE_FILE, state)
+        except Exception:
+            pass
 
+    elapsed = _time.monotonic() - _START_TIME
     print(
         f"[DONE] initialized={state['initialized']} "
         f"sites={len(cfg['websites'])} "
         f"sent_this_run={sent_count} "
         f"pending={state['stats']['pending']} "
-        f"errors_this_run={run_errors}"
+        f"errors_this_run={run_errors} "
+        f"elapsed={elapsed:.1f}s"
     )
     return 0
 
