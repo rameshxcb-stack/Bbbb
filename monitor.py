@@ -37,7 +37,7 @@ FALLBACK_MODELS = [
 FUZZY_DUPLICATE_THRESHOLD = 97
 
 MAX_PDF_SEND_BYTES = 45 * 1024 * 1024
-MAX_GEMINI_PDF_BYTES = 18 * 1024 * 1024  # Gemini inline PDF ~20MB limit
+MAX_GEMINI_PDF_BYTES = 18 * 1024 * 1024
 MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "8"))
 MAX_PDF_TEXT_CHARS = 4000
 MAX_PDF_ATTEMPTS = 3
@@ -62,11 +62,12 @@ NOTIFY_LANGUAGE = os.getenv("NOTIFY_LANGUAGE", "both").strip().lower()
 if NOTIFY_LANGUAGE not in {"both", "hi", "en"}:
     NOTIFY_LANGUAGE = "both"
 
-STALE_NOTICE_DAYS = int(os.getenv("STALE_NOTICE_DAYS", "30"))
+# ⭐ CHANGE #1: Default 30 → 10
+STALE_NOTICE_DAYS = int(os.getenv("STALE_NOTICE_DAYS", "10"))
 
 USER_AGENT = os.getenv(
     "MONITOR_USER_AGENT",
-    "Mozilla/5.0 (compatible; JharkhandNoticeMonitor/7.1)"
+    "Mozilla/5.0 (compatible; JharkhandNoticeMonitor/7.2)"
 )
 
 STRONG_KEYWORDS = [
@@ -83,7 +84,6 @@ _GEMINI_API_KEY = ""
 
 
 def _cache_put(url, content):
-    """Bounded cache insertion (FIFO eviction)."""
     if url in _RUNTIME_PDF_CACHE:
         return
     if len(_RUNTIME_PDF_CACHE) >= _RUNTIME_PDF_CACHE_MAX_ITEMS:
@@ -106,7 +106,6 @@ _PDF_URL_HINTS = (
 
 
 def _looks_like_pdf_url(url):
-    """Heuristic: does this URL likely point to a PDF?"""
     if not url:
         return False
     u = url.lower()
@@ -122,7 +121,6 @@ def _looks_like_pdf_url(url):
 
 
 def _looks_like_pdf_response(content, content_type, url=""):
-    """Check response bytes+headers to confirm PDF."""
     if not content:
         return False
     ct = (content_type or "").lower()
@@ -139,15 +137,10 @@ def _looks_like_pdf_response(content, content_type, url=""):
     return False
 
 
-# ===========================================================================
-# NEW: Global PDF candidate collector
-# ===========================================================================
-
 def _collect_all_pdf_candidates(html_text, base_url, max_candidates=15):
     """
     HTML se SAARE possible PDF candidates collect karo, priority ke saath.
     Content-based approach — kisi bhi pattern/text/URL pe depend nahi.
-    Returns list of (url, priority) sorted high→low.
     """
     if not html_text:
         return []
@@ -290,16 +283,11 @@ def _collect_all_pdf_candidates(html_text, base_url, max_candidates=15):
 
 
 def _find_pdf_link_in_html(html_text, base_url):
-    """Wrapper: highest-priority candidate return karo."""
     ranked = _collect_all_pdf_candidates(html_text, base_url, max_candidates=1)
     return ranked[0][0] if ranked else None
 
 
 def _download_with_pdf_resolution(session, url, timeout, depth=0, _visited=None):
-    """
-    Download url. If HTML, try multiple embedded PDF candidates.
-    Returns (content_bytes | None, actual_url, method_string).
-    """
     if _visited is None:
         _visited = set()
 
@@ -311,7 +299,6 @@ def _download_with_pdf_resolution(session, url, timeout, depth=0, _visited=None)
     if depth > 3:
         return None, url, "max_depth_exceeded"
 
-    # HEAD check for size
     try:
         head = session.head(url, timeout=min(10, timeout), allow_redirects=True)
         cl = head.headers.get("content-length")
@@ -345,7 +332,6 @@ def _download_with_pdf_resolution(session, url, timeout, depth=0, _visited=None)
         except Exception:
             return None, url, "html_decode_error"
 
-        # Collect ALL candidates, try in priority order
         candidates = _collect_all_pdf_candidates(html_text, final_url, max_candidates=10)
 
         for cand_url, priority in candidates:
@@ -468,7 +454,6 @@ def _is_empty_page_text(html_text):
 
 
 def _title_from_url(url, min_len=8):
-    """Extract human-readable title from URL slug (Devanagari-safe)."""
     try:
         path = unquote(urlparse(url).path or "")
     except Exception:
@@ -556,6 +541,10 @@ _UPLOAD_DATE_TEXT_PATTERNS = [
 
 
 def _extract_upload_date(anchor_tag):
+    """
+    ⭐ CHANGE #5: 'ds[0]' (pehli date) → 'max(ds)' (latest date).
+    NIC sites often list reference (old) date + publish (new) date.
+    """
     try:
         search_root = (
             anchor_tag.find_parent("tr")
@@ -580,36 +569,46 @@ def _extract_upload_date(anchor_tag):
                     pass
                 ds = _extract_full_dates(raw)
                 if ds:
-                    return ds[0]
+                    return max(ds)              # ⭐ LATEST
         text = search_root.get_text(" ", strip=True)
         for pat in _UPLOAD_DATE_TEXT_PATTERNS:
             m = pat.search(text)
             if m:
                 ds = _extract_full_dates(m.group(1))
                 if ds:
-                    return ds[0]
+                    return max(ds)              # ⭐ LATEST
     except Exception:
         pass
     return None
 
 
 def _is_stale_notice(title, context, url, upload_date=None):
+    """
+    ⭐ CHANGE #6: Combine upload_date + context dates, use LATEST.
+    Handles: reference date 2020 + publish date 2026 → picks 2026.
+    """
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=STALE_NOTICE_DAYS)
+
+    candidate_dates = []
+
     if upload_date is not None:
         if upload_date.tzinfo is None:
             upload_date = upload_date.replace(tzinfo=timezone.utc)
-        if upload_date > now:
-            return False
-        return upload_date < cutoff
-    haystack = f"{title} {context}".strip()
-    all_dates = _extract_full_dates(haystack)
-    if all_dates:
-        latest = max(all_dates)
-        if latest > now:
-            return False
-        return latest < cutoff
-    return False
+        candidate_dates.append(upload_date)
+
+    haystack = f"{title} {context} {url}".strip()
+    candidate_dates.extend(_extract_full_dates(haystack))
+
+    if not candidate_dates:
+        return False  # no dates → keep
+
+    past_dates = [d for d in candidate_dates if d <= now]
+    if not past_dates:
+        return False
+
+    latest = max(past_dates)
+    return latest < cutoff
 
 
 # ---------------------------------------------------------------------------
@@ -706,7 +705,7 @@ def get_config():
         "gemini_max_calls_per_run": 15,
         "retention_days": 90,
         "max_pending_attempts": 12,
-        "stale_notice_days": 30,
+        "stale_notice_days": 10,
         "keywords": [],
         "discovery_keywords": [],
         "sitemap_enabled": True,
@@ -950,9 +949,6 @@ def extract_candidates(html_text, page_url, site, scan):
                 else:
                     continue
 
-        # ============================================================
-        # CHANGED: Broaden pdf_bonus to catch extension-less PDFs
-        # ============================================================
         score = local_score(title, href, context, keywords)
         href_lower = href.lower()
         pdf_bonus = 0
@@ -969,8 +965,7 @@ def extract_candidates(html_text, page_url, site, scan):
         )):
             pdf_bonus = 1
         else:
-            # Fallback: any non-nav link gets a try (magic bytes will confirm)
-            pdf_bonus = 1
+            pdf_bonus = 1  # fallback: try
 
         if score <= 0 and pdf_bonus == 0:
             continue
@@ -1152,6 +1147,13 @@ def _extract_pdf_text_ocr(content):
 
 
 def _extract_with_gemini_pdf(pdf_bytes):
+    """
+    ⭐ CHANGE #2-4:
+    - timeout 60 → 180
+    - maxOutputTokens 8192 → 16384
+    - 4xx errors logged
+    - 2 attempts per model (timeout pe retry)
+    """
     if not GEMINI_PDF_OCR_ENABLED or not _GEMINI_API_KEY:
         return ""
 
@@ -1177,17 +1179,15 @@ def _extract_with_gemini_pdf(pdf_bytes):
             "contents": [{
                 "parts": [
                     {"text": prompt},
-                    {
-                        "inline_data": {
-                            "mime_type": "application/pdf",
-                            "data": pdf_b64,
-                        }
-                    }
+                    {"inline_data": {
+                        "mime_type": "application/pdf",
+                        "data": pdf_b64,
+                    }}
                 ]
             }],
             "generationConfig": {
                 "temperature": 0.0,
-                "maxOutputTokens": 8192,
+                "maxOutputTokens": 16384,       # ⭐ 8192 → 16384
             },
         }
 
@@ -1201,24 +1201,50 @@ def _extract_with_gemini_pdf(pdf_bytes):
                 "https://generativelanguage.googleapis.com/"
                 f"v1beta/models/{model}:generateContent"
             )
-            try:
-                response = requests.post(
-                    endpoint, headers=headers,
-                    json=payload, timeout=60,
-                )
-                if response.status_code == 429:
-                    print(f"[WARN] Gemini PDF OCR rate limited ({model})", file=sys.stderr)
-                    continue
-                if response.status_code >= 400:
-                    continue
-                data = response.json()
-                text = _extract_gemini_text(data)
-                if text and len(text.strip()) > 50:
-                    print(f"[INFO] Gemini PDF OCR succeeded ({model})", file=sys.stderr)
-                    return text
-            except Exception as exc:
-                print(f"[WARN] Gemini PDF failed ({model}): {exc}", file=sys.stderr)
-                continue
+            # ⭐ 2 attempts per model (timeout pe retry)
+            for attempt in range(2):
+                try:
+                    response = requests.post(
+                        endpoint, headers=headers,
+                        json=payload,
+                        timeout=180,            # ⭐ 60 → 180
+                    )
+
+                    if response.status_code == 429:
+                        print(f"[WARN] Gemini 429 rate limit ({model})", file=sys.stderr)
+                        time.sleep(15)
+                        continue
+
+                    if response.status_code >= 400:
+                        # ⭐ Log WHY it failed (was silent before)
+                        print(
+                            f"[WARN] Gemini {response.status_code} ({model}): "
+                            f"{response.text[:200]}",
+                            file=sys.stderr,
+                        )
+                        break  # next model
+
+                    data = response.json()
+                    text = _extract_gemini_text(data)
+                    if text and len(text.strip()) > 50:
+                        print(
+                            f"[INFO] Gemini PDF OCR succeeded ({model}, attempt {attempt+1})",
+                            file=sys.stderr,
+                        )
+                        return text
+                    break  # empty response → next model
+
+                except requests.Timeout:
+                    print(
+                        f"[WARN] Gemini timeout ({model}), attempt {attempt+1}/2",
+                        file=sys.stderr,
+                    )
+                    continue  # retry same model
+
+                except Exception as exc:
+                    print(f"[WARN] Gemini error ({model}): {exc}", file=sys.stderr)
+                    break
+
     except Exception as exc:
         print(f"[WARN] Gemini PDF OCR failed: {exc}", file=sys.stderr)
 
@@ -1990,7 +2016,6 @@ def send_telegram_document(token, chat_id, pdf_bytes, filename, caption=""):
 
 
 def _safe_filename(url, default="notice.pdf"):
-    """Generate clean filename from URL slug."""
     try:
         parsed = urlparse(url)
         name = parsed.path.rsplit("/", 1)[-1]
@@ -2011,7 +2036,6 @@ def _safe_filename(url, default="notice.pdf"):
 
 
 def _build_pdf_caption(full_message, classification):
-    """Build PDF caption with priority fields up top."""
     if not classification:
         return full_message[:TELEGRAM_CAPTION_LIMIT]
 
@@ -2796,10 +2820,6 @@ def refresh_stats(state):
 # ---------------------------------------------------------------------------
 
 def _should_fetch_pdf(record):
-    """
-    Broaden: try PDF fetch for ANY non-listing URL.
-    Magic bytes will confirm whether it's a PDF.
-    """
     if record.get("pdf_extracted") or record.get("pdf_text"):
         return False
     if int(record.get("pdf_attempts", 0)) >= MAX_PDF_ATTEMPTS:
@@ -2808,7 +2828,6 @@ def _should_fetch_pdf(record):
     url = record.get("url", "")
     url_lower = url.lower()
 
-    # Only real listing/archive pages skip
     if any(pat in url_lower for pat in (
         "/past-notices", "/past_notices",
         "/whats-new", "/whats_new",
@@ -2818,7 +2837,6 @@ def _should_fetch_pdf(record):
     )):
         return False
 
-    # Home page skip
     try:
         parsed = urlparse(url)
         if parsed.path in ("", "/"):
@@ -2826,7 +2844,6 @@ def _should_fetch_pdf(record):
     except Exception:
         pass
 
-    # Try everything else
     return True
 
 
@@ -3023,6 +3040,20 @@ def main():
                 site_items_list.append((iid, record["title"], record["url"]))
             else:
                 record["last_seen"] = utc_now()
+
+                # ⭐ CHANGE #7: Baseline title-change detection
+                if record.get("status") == "baseline":
+                    old_title = (record.get("title") or "").strip()
+                    new_title = (candidate.get("title") or "").strip()
+                    if old_title and new_title and old_title != new_title and len(new_title) >= 8:
+                        record["status"] = "pending"
+                        record["attempts"] = 0
+                        record["last_error"] = None
+                        record["pdf_extracted"] = False
+                        record["pdf_text"] = ""
+                        record["pdf_attempts"] = 0
+                        print(f"[RE-PROCESS] Title changed: {new_title[:80]}")
+
                 if candidate["title"]:
                     record["title"] = candidate["title"]
                 if candidate.get("context"):
@@ -3124,6 +3155,36 @@ def main():
             record["last_error"] = detail
             run_errors += 1
             print(f"[WARN] Telegram delivery failed; will retry: {detail}", file=sys.stderr)
+
+    # ⭐ CHANGE #8: Health alert — 24h no notices
+    try:
+        if sent_count == 0:
+            last_notify_str = state.get("last_successful_notify_at")
+            should_alert = False
+            if last_notify_str:
+                try:
+                    last_dt = datetime.fromisoformat(last_notify_str.replace("Z", "+00:00"))
+                    if last_dt.tzinfo is None:
+                        last_dt = last_dt.replace(tzinfo=timezone.utc)
+                    hours_since = (datetime.now(timezone.utc) - last_dt).total_seconds() / 3600
+                    if hours_since >= 24:
+                        should_alert = True
+                except Exception:
+                    pass
+
+            if should_alert:
+                alert_msg = (
+                    f"⚠️ <b>Monitor Health Alert</b>\n\n"
+                    f"Last 24 hours me koi notice nahi mila.\n"
+                    f"Last successful delivery: {last_notify_str or 'unknown'}\n\n"
+                    f"Check kar lo — kuch to gadbad hai."
+                )
+                send_telegram(token, chat_id, alert_msg)
+                print("[ALERT] 24h no notices — health alert sent", file=sys.stderr)
+        else:
+            state["last_successful_notify_at"] = utc_now()
+    except Exception as exc:
+        print(f"[WARN] Health alert check failed: {exc}", file=sys.stderr)
 
     _RUNTIME_PDF_CACHE.clear()
 
