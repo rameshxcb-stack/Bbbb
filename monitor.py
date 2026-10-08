@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import html
 import io
@@ -35,20 +36,24 @@ FALLBACK_MODELS = [
 FUZZY_DUPLICATE_THRESHOLD = 97
 
 MAX_PDF_BYTES = 5 * 1024 * 1024
-MAX_PDF_PAGES = 3
-MAX_PDF_TEXT_CHARS = 3500
+MAX_PDF_SEND_BYTES = 45 * 1024 * 1024
+MAX_PDF_PAGES = 8
+MAX_PDF_TEXT_CHARS = 4000
 MAX_PDF_ATTEMPTS = 3
 TELEGRAM_SAFE_LIMIT = 4000
+TELEGRAM_CAPTION_LIMIT = 1024
 
-# Gemini output — raised for larger schemas
 GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "16384"))
 
-# OCR settings
 OCR_ENABLED = os.getenv("OCR_ENABLED", "true").strip().lower() == "true"
 OCR_DPI = int(os.getenv("OCR_DPI", "200"))
-OCR_LANG = os.getenv("OCR_LANG", "eng")          # "eng" default — Hindi quality poor
+OCR_LANG = os.getenv("OCR_LANG", "eng+hin")
 OCR_MIN_TEXT_CHARS = int(os.getenv("OCR_MIN_TEXT_CHARS", "200"))
-OCR_MAX_WORKERS = int(os.getenv("OCR_MAX_WORKERS", "1"))   # sequential for CPU-bound
+OCR_MAX_WORKERS = int(os.getenv("OCR_MAX_WORKERS", "1"))
+
+GEMINI_PDF_OCR_ENABLED = os.getenv("GEMINI_PDF_OCR_ENABLED", "true").strip().lower() == "true"
+
+SEND_PDF_ENABLED = os.getenv("SEND_PDF_ENABLED", "true").strip().lower() == "true"
 
 NOTIFY_LANGUAGE = os.getenv("NOTIFY_LANGUAGE", "both").strip().lower()
 if NOTIFY_LANGUAGE not in {"both", "hi", "en"}:
@@ -58,7 +63,7 @@ STALE_NOTICE_DAYS = int(os.getenv("STALE_NOTICE_DAYS", "30"))
 
 USER_AGENT = os.getenv(
     "MONITOR_USER_AGENT",
-    "Mozilla/5.0 (compatible; JharkhandNoticeMonitor/6.1)"
+    "Mozilla/5.0 (compatible; JharkhandNoticeMonitor/6.4)"
 )
 
 STRONG_KEYWORDS = [
@@ -69,6 +74,12 @@ STRONG_KEYWORDS = [
     "भर्ती", "परिणाम", "नियुक्ति", "प्रवेश", "छात्रवृत्ति",
     "सूचना", "नोटिस", "निविदा"
 ]
+
+# Runtime PDF cache
+_RUNTIME_PDF_CACHE: Dict[str, bytes] = {}
+
+# Gemini API key (set in main)
+_GEMINI_API_KEY = ""
 
 
 # ---------------------------------------------------------------------------
@@ -388,9 +399,9 @@ def get_config():
         "max_workers": 10,
         "max_items_per_site": 100,
         "max_discovery_pages_per_site": 5,
-        "max_new_items_per_run": 30,
-        "gemini_batch_size": 2,
-        "gemini_max_calls_per_run": 25,
+        "max_new_items_per_run": 25,
+        "gemini_batch_size": 3,
+        "gemini_max_calls_per_run": 15,
         "retention_days": 90,
         "max_pending_attempts": 12,
         "stale_notice_days": 30,
@@ -449,7 +460,7 @@ def get_config():
 
 def default_state():
     return {
-        "version": 16,
+        "version": 19,
         "initialized": False,
         "last_run": None,
         "items": {},
@@ -488,11 +499,13 @@ def load_state():
         record.setdefault("pdf_text", "")
         record.setdefault("pdf_attempts", 0)
         record.setdefault("ocr_used", False)
+        record.setdefault("pdf_method", "")
         record.setdefault("telegram_attempts", 0)
+        record.setdefault("pdf_sent", False)
         record.setdefault("upload_date", None)
         record.setdefault("first_seen", utc_now())
         record.setdefault("last_seen", record["first_seen"])
-    state["version"] = 16
+    state["version"] = 19
     return state
 
 
@@ -754,13 +767,13 @@ def _extract_pdf_text_plumber(content):
     parts = []
     try:
         with pdfplumber.open(io.BytesIO(content)) as pdf:
-            for page in pdf.pages[:MAX_PDF_PAGES]:
+            for idx, page in enumerate(pdf.pages[:MAX_PDF_PAGES]):
                 try:
                     t = page.extract_text() or ""
                     if t.strip():
                         parts.append(t)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    print(f"[WARN] Page {idx+1} text extract failed: {exc}", file=sys.stderr)
                 try:
                     tables = page.extract_tables() or []
                     for table in tables:
@@ -768,14 +781,15 @@ def _extract_pdf_text_plumber(content):
                             cells = [str(c).strip() for c in row if c]
                             if cells:
                                 parts.append(" | ".join(cells))
-                except Exception:
-                    pass
-    except Exception:
-        pass
+                except Exception as exc:
+                    print(f"[WARN] Page {idx+1} table extract failed: {exc}", file=sys.stderr)
+    except Exception as exc:
+        print(f"[WARN] pdfplumber open failed: {exc}", file=sys.stderr)
     return "\n".join(parts)
 
 
 def _extract_pdf_text_ocr(content):
+    """Tesseract OCR fallback."""
     parts = []
     try:
         images = convert_from_bytes(
@@ -784,25 +798,89 @@ def _extract_pdf_text_ocr(content):
             last_page=MAX_PDF_PAGES,
             dpi=OCR_DPI,
         )
-        for img in images:
+        for idx, img in enumerate(images):
             try:
                 txt = pytesseract.image_to_string(img, lang=OCR_LANG) or ""
                 if txt.strip():
                     parts.append(txt)
             except Exception as exc:
-                print(f"[WARN] OCR page failed: {exc}", file=sys.stderr)
+                print(f"[WARN] Tesseract page {idx+1} failed: {exc}", file=sys.stderr)
     except Exception as exc:
-        print(f"[WARN] OCR conversion failed: {exc}", file=sys.stderr)
+        print(f"[WARN] Tesseract conversion failed: {exc}", file=sys.stderr)
     return "\n".join(parts)
 
 
+def _extract_with_gemini_pdf(pdf_bytes):
+    """
+    Send PDF directly to Gemini (native PDF support).
+    Tries all 3 fallback models. Returns text or empty string.
+    """
+    if not GEMINI_PDF_OCR_ENABLED or not _GEMINI_API_KEY:
+        return ""
+
+    try:
+        pdf_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+
+        prompt = (
+            "Extract ALL text from this government notice PDF. "
+            "May be in Hindi, English, or both. May contain tables. "
+            "Return extracted text verbatim, preserving structure. "
+            "Do NOT summarize. Do NOT invent. Just extract the text."
+        )
+
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"text": prompt},
+                    {
+                        "inline_data": {
+                            "mime_type": "application/pdf",
+                            "data": pdf_b64,
+                        }
+                    }
+                ]
+            }],
+            "generationConfig": {
+                "temperature": 0.0,
+                "maxOutputTokens": 8192,
+            },
+        }
+
+        headers = {
+            "x-goog-api-key": _GEMINI_API_KEY,
+            "Content-Type": "application/json",
+        }
+
+        for model in FALLBACK_MODELS:
+            endpoint = (
+                "https://generativelanguage.googleapis.com/"
+                f"v1beta/models/{model}:generateContent"
+            )
+            try:
+                response = requests.post(
+                    endpoint, headers=headers,
+                    json=payload, timeout=60,
+                )
+                if response.status_code == 429:
+                    print(f"[WARN] Gemini PDF OCR rate limited ({model})", file=sys.stderr)
+                    continue
+                if response.status_code >= 400:
+                    continue
+                data = response.json()
+                text = _extract_gemini_text(data)
+                if text and len(text.strip()) > 50:
+                    print(f"[INFO] Gemini PDF OCR succeeded ({model})", file=sys.stderr)
+                    return text
+            except Exception as exc:
+                print(f"[WARN] Gemini PDF failed ({model}): {exc}", file=sys.stderr)
+                continue
+    except Exception as exc:
+        print(f"[WARN] Gemini PDF OCR failed: {exc}", file=sys.stderr)
+
+    return ""
+
+
 def _text_looks_thin(text):
-    """
-    Return True if pdfplumber text is too thin to be useful:
-      - less than OCR_MIN_TEXT_CHARS characters, OR
-      - no digits (likely just watermark / headers), OR
-      - fewer than 3 newlines (likely 1-2 lines only)
-    """
     stripped = (text or "").strip()
     if len(stripped) < OCR_MIN_TEXT_CHARS:
         return True
@@ -813,45 +891,75 @@ def _text_looks_thin(text):
     return False
 
 
-def download_pdf_text(session, pdf_url, timeout=30):
+def download_pdf_content(pdf_url, timeout=30):
     """
-    Extract text from a PDF:
-      1. Try pdfplumber (text-based)
-      2. If text looks thin AND OCR enabled → run OCR
-      3. Return best of the two + flag whether OCR was used
+    Download PDF once. Returns (content_bytes, text, ocr_used, method).
+    OCR chain: pdfplumber → Gemini PDF → Tesseract.
+    Uses runtime cache to avoid re-download.
     """
-    try:
-        response = session.get(pdf_url, timeout=timeout)
-        if response.status_code >= 400:
-            return "", False
-        content_length = response.headers.get("content-length")
-        if content_length:
+    global _RUNTIME_PDF_CACHE
+
+    if pdf_url in _RUNTIME_PDF_CACHE:
+        content = _RUNTIME_PDF_CACHE[pdf_url]
+    else:
+        try:
+            session = make_session()
             try:
-                if int(content_length) > MAX_PDF_BYTES:
-                    return "", False
-            except (TypeError, ValueError):
+                head = session.head(pdf_url, timeout=10, allow_redirects=True)
+                cl = head.headers.get("content-length")
+                if cl:
+                    try:
+                        if int(cl) > MAX_PDF_SEND_BYTES:
+                            return None, "", False, "size_limit"
+                    except (TypeError, ValueError):
+                        pass
+            except Exception:
                 pass
-        content = response.content
-        if not content or len(content) > MAX_PDF_BYTES:
-            return "", False
 
-        text = _extract_pdf_text_plumber(content)
-        ocr_used = False
+            response = session.get(pdf_url, timeout=timeout)
+            if response.status_code >= 400:
+                return None, "", False, "http_error"
+            content = response.content
+            if not content or len(content) > MAX_PDF_SEND_BYTES:
+                return None, "", False, "size_limit"
+            _RUNTIME_PDF_CACHE[pdf_url] = content
+        except Exception as exc:
+            print(f"[WARN] PDF download failed for {pdf_url}: {exc}", file=sys.stderr)
+            return None, "", False, "download_error"
 
-        # OCR fallback: only if plumber text is weak
-        if OCR_ENABLED and _text_looks_thin(text):
-            try:
-                ocr_text = _extract_pdf_text_ocr(content)
-                if ocr_text.strip() and len(ocr_text.strip()) > len(text.strip()):
-                    text = ocr_text
-                    ocr_used = True
-            except Exception as exc:
-                print(f"[WARN] OCR failed for {pdf_url}: {exc}", file=sys.stderr)
+    text = _extract_pdf_text_plumber(content)
+    method = "plumber"
 
-        return clean_text(text, MAX_PDF_TEXT_CHARS), ocr_used
-    except Exception as exc:
-        print(f"[WARN] PDF extract failed for {pdf_url}: {exc}", file=sys.stderr)
-        return "", False
+    if _text_looks_thin(text):
+        print(f"[INFO] PDF thin ({len(text)} chars). Trying Gemini PDF OCR...", file=sys.stderr)
+        gemini_text = _extract_with_gemini_pdf(content)
+
+        if gemini_text and len(gemini_text.strip()) > len(text.strip()):
+            text = (
+                f"{text}\n\n--- GEMINI OCR ---\n\n{gemini_text}"
+                if text.strip() else gemini_text
+            )
+            method = "gemini"
+            print(f"[INFO] Gemini OCR succeeded ({len(gemini_text)} chars)", file=sys.stderr)
+        else:
+            print("[INFO] Gemini failed. Trying Tesseract...", file=sys.stderr)
+            tess_text = _extract_pdf_text_ocr(content)
+            if tess_text and len(tess_text.strip()) > len(text.strip()):
+                text = (
+                    f"{text}\n\n--- TESSERACT OCR ---\n\n{tess_text}"
+                    if text.strip() else tess_text
+                )
+                method = "tesseract"
+                print(f"[INFO] Tesseract OCR succeeded ({len(tess_text)} chars)", file=sys.stderr)
+            else:
+                print("[WARN] All OCR methods failed", file=sys.stderr)
+
+    return (
+        content,
+        clean_text(text, MAX_PDF_TEXT_CHARS),
+        method != "plumber",
+        method,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -923,10 +1031,11 @@ def _build_prompt(prompt_items):
         "3. summary — 1-line summary (<= 150 chars)\n\n"
 
         "IMPORTANT: If 'pdf_text' is provided, treat it as PRIMARY source. "
-        "The text may come from OCR and could have minor errors — extract "
-        "values even if a few characters look odd, but do NOT invent data.\n\n"
+        "The text may come from OCR (scanned PDF) and could have minor errors. "
+        "Extract only what you are confident about. "
+        "If a value is unclear, set it to null instead of guessing.\n\n"
 
-        "── UNIVERSAL FIELDS (extract for ALL categories if present) ──\n"
+        "── UNIVERSAL FIELDS ──\n"
         "reference_number, issuing_authority, issuing_date, "
         "contact_person, contact_number, email, helpline_number, "
         "official_address, important_instructions\n\n"
@@ -1009,15 +1118,9 @@ def _build_prompt(prompt_items):
         "order_link, notice_type, applicable_to, action_required, "
         "action_deadline, supersedes\n\n"
 
-        "── EXTRA DETAILS (ALWAYS EXTRACT) ──\n"
-        "For EVERY item, also extract ALL other fields that appear in the "
-        "notice but are not covered above, into 'extra_details' as an array "
-        "of {\"label\": \"...\", \"value\": \"...\"}. "
-        "Include every numbered item, bullet point, table row, or "
-        "field-value pair you find. Extract the EXACT text as written. "
-        "Limit to the 10 most important extra fields per item. "
-        "Set 'extra_details_present' to true if the notice contains a "
-        "table or numbered list of fields.\n\n"
+        "── EXTRA DETAILS ──\n"
+        "Extract ALL other fields into 'extra_details' as array of "
+        "{\"label\": \"...\", \"value\": \"...\"}. Limit 10 per item.\n\n"
 
         "Do NOT invent facts. Use null when unsure.\n\n"
 
@@ -1097,7 +1200,6 @@ def _build_prompt(prompt_items):
 
 
 def _normalize_label(label):
-    """Strip punctuation (colons, dots) and lowercase for comparison."""
     return re.sub(r"[^\w\s]", "", (label or "").lower()).strip()
 
 
@@ -1170,7 +1272,6 @@ def _parse_gemini_response(text, item_count):
             "important": bool(row.get("important", False)),
             "category": clean_text(str(row.get("category", "notice")), 40) or "notice",
             "summary": clean_text(str(row.get("summary", "")), 200),
-            # Universal
             "reference_number": _str(row, "reference_number", 100),
             "issuing_authority": _str(row, "issuing_authority", 200),
             "issuing_date": _str(row, "issuing_date", 80),
@@ -1180,7 +1281,6 @@ def _parse_gemini_response(text, item_count):
             "helpline_number": _str(row, "helpline_number", 100),
             "official_address": _str(row, "official_address", 300),
             "important_instructions": _str(row, "important_instructions", 400),
-            # Vacancy
             "total_posts": row.get("total_posts"),
             "post_details": clean_posts,
             "qualification": _str(row, "qualification", 250),
@@ -1205,7 +1305,6 @@ def _parse_gemini_response(text, item_count):
             "venue": _str(row, "venue", 250),
             "reporting_time": _str(row, "reporting_time", 60),
             "engagement_type": _str(row, "engagement_type", 100),
-            # Result
             "result_for": _str(row, "result_for", 200),
             "exam_name": _str(row, "exam_name", 200),
             "session": _str(row, "session", 80),
@@ -1223,7 +1322,6 @@ def _parse_gemini_response(text, item_count):
             "rechecking_link": _str(row, "rechecking_link", 500),
             "rechecking_fee": _str(row, "rechecking_fee", 100),
             "rechecking_mode": _str(row, "rechecking_mode", 80),
-            # Admit card
             "exam_date": _str(row, "exam_date", 80),
             "exam_time": _str(row, "exam_time", 60),
             "exam_duration": _str(row, "exam_duration", 60),
@@ -1234,7 +1332,6 @@ def _parse_gemini_response(text, item_count):
             "admit_card_link": _str(row, "admit_card_link", 500),
             "instructions": _str(row, "instructions", 400),
             "download_mode": _str(row, "download_mode", 80),
-            # Answer key
             "total_questions": _str(row, "total_questions", 60),
             "answer_key_link": _str(row, "answer_key_link", 500),
             "objection_start_date": _str(row, "objection_start_date", 80),
@@ -1245,7 +1342,6 @@ def _parse_gemini_response(text, item_count):
             "objection_address": _str(row, "objection_address", 250),
             "payment_mode": _str(row, "payment_mode", 100),
             "answer_key_type": _str(row, "answer_key_type", 80),
-            # Admission
             "course_name": _str(row, "course_name", 200),
             "course_duration": _str(row, "course_duration", 80),
             "university_name": _str(row, "university_name", 200),
@@ -1260,7 +1356,6 @@ def _parse_gemini_response(text, item_count):
             "entrance_exam_name": _str(row, "entrance_exam_name", 200),
             "hostel_available": _str(row, "hostel_available", 60),
             "prospectus_link": _str(row, "prospectus_link", 500),
-            # Counselling
             "round": _str(row, "round", 60),
             "counselling_time": _str(row, "counselling_time", 60),
             "seat_matrix": _str(row, "seat_matrix", 200),
@@ -1269,7 +1364,6 @@ def _parse_gemini_response(text, item_count):
             "required_documents": _str(row, "required_documents", 400),
             "counselling_mode": _str(row, "counselling_mode", 80),
             "next_round_date": _str(row, "next_round_date", 80),
-            # Scholarship
             "scheme_name": _str(row, "scheme_name", 200),
             "scholarship_amount": _str(row, "scholarship_amount", 150),
             "scholarship_duration": _str(row, "scholarship_duration", 100),
@@ -1283,7 +1377,6 @@ def _parse_gemini_response(text, item_count):
             "caste_certificate_required": _str(row, "caste_certificate_required", 40),
             "selection_criteria": _str(row, "selection_criteria", 250),
             "helpline": _str(row, "helpline", 100),
-            # Exam schedule
             "exam_start_date": _str(row, "exam_start_date", 80),
             "exam_end_date": _str(row, "exam_end_date", 80),
             "timetable_link": _str(row, "timetable_link", 500),
@@ -1291,7 +1384,6 @@ def _parse_gemini_response(text, item_count):
             "paper_code": _str(row, "paper_code", 200),
             "practical_dates": _str(row, "practical_dates", 150),
             "viva_dates": _str(row, "viva_dates", 150),
-            # Tender
             "tender_no": _str(row, "tender_no", 100),
             "tender_type": _str(row, "tender_type", 100),
             "work_description": _str(row, "work_description", 300),
@@ -1310,13 +1402,11 @@ def _parse_gemini_response(text, item_count):
             "completion_period": _str(row, "completion_period", 100),
             "payment_terms": _str(row, "payment_terms", 250),
             "eligibility_criteria": _str(row, "eligibility_criteria", 300),
-            # Gazette
             "gazette_no": _str(row, "gazette_no", 100),
             "gazette_type": _str(row, "gazette_type", 100),
             "publication_date": _str(row, "publication_date", 80),
             "gazette_link": _str(row, "gazette_link", 500),
             "gazette_content": _str(row, "gazette_content", 400),
-            # Land revenue
             "notification_no": _str(row, "notification_no", 100),
             "land_location": _str(row, "land_location", 250),
             "affected_area": _str(row, "affected_area", 100),
@@ -1333,17 +1423,14 @@ def _parse_gemini_response(text, item_count):
             "objections_last_date": _str(row, "objections_last_date", 80),
             "objections_address": _str(row, "objections_address", 250),
             "land_type": _str(row, "land_type", 100),
-            # Press release
             "issuing_department": _str(row, "issuing_department", 200),
             "release_date": _str(row, "release_date", 80),
             "release_link": _str(row, "release_link", 500),
             "full_content": _str(row, "full_content", 500),
-            # Announcement
             "announcement_type": _str(row, "announcement_type", 100),
             "target_audience": _str(row, "target_audience", 200),
             "action_required": _str(row, "action_required", 250),
             "action_deadline": _str(row, "action_deadline", 80),
-            # Publication
             "publication_name": _str(row, "publication_name", 200),
             "publication_type": _str(row, "publication_type", 100),
             "publisher": _str(row, "publisher", 200),
@@ -1354,12 +1441,10 @@ def _parse_gemini_response(text, item_count):
             "edition": _str(row, "edition", 60),
             "isbn": _str(row, "isbn", 60),
             "price": _str(row, "price", 60),
-            # Notice
             "subject": _str(row, "subject", 200),
             "notice_type": _str(row, "notice_type", 100),
             "applicable_to": _str(row, "applicable_to", 200),
             "supersedes": _str(row, "supersedes", 200),
-            # Extra details
             "extra_details": _clean_extra_details(row.get("extra_details")),
             "extra_details_present": bool(row.get("extra_details_present", False)),
         }
@@ -1511,27 +1596,116 @@ def send_telegram(token, chat_id, text):
     return (False, False, "Telegram send failed")
 
 
+def send_telegram_document(token, chat_id, pdf_bytes, filename, caption=""):
+    for attempt in range(3):
+        try:
+            files = {"document": (filename, pdf_bytes, "application/pdf")}
+            data = {
+                "chat_id": chat_id,
+                "caption": caption[:TELEGRAM_CAPTION_LIMIT],
+                "parse_mode": "HTML",
+            }
+            response = requests.post(
+                f"https://api.telegram.org/bot{token}/sendDocument",
+                data=data,
+                files=files,
+                timeout=60,
+            )
+            if response.ok:
+                return (True, False, "sent")
+            try:
+                rdata = response.json()
+                description = clean_text(str(rdata.get("description", response.text)), 400)
+                retry_after = int((rdata.get("parameters") or {}).get("retry_after", 0) or 0)
+            except Exception:
+                description = clean_text(response.text, 400)
+                retry_after = 0
+            if response.status_code in (400, 401, 403, 404):
+                return (False, True, f"Telegram HTTP {response.status_code}: {description}")
+            if response.status_code == 429 and attempt < 2:
+                time.sleep(min(max(retry_after + 1, 2), 60))
+                continue
+            if response.status_code >= 500 and attempt < 2:
+                time.sleep(min(10, 2 ** attempt))
+                continue
+            return (False, False, f"Telegram HTTP {response.status_code}: {description}")
+        except requests.RequestException as exc:
+            if attempt < 2:
+                time.sleep(min(10, 2 ** attempt))
+                continue
+            return (False, False, f"Telegram network error: {exc}")
+    return (False, False, "Telegram send document failed")
+
+
+def _safe_filename(url, default="notice.pdf"):
+    try:
+        name = url.rsplit("/", 1)[-1].split("?")[0]
+        if name and name.lower().endswith(".pdf"):
+            return name[:100]
+    except Exception:
+        pass
+    return default
+
+
+def send_notification_with_pdf(token, chat_id, record, full_message):
+    """
+    Send PDF document with caption. SINGLE MESSAGE ONLY.
+    Uses runtime cache to avoid re-download.
+    """
+    pdf_url = record.get("url", "")
+    filename = _safe_filename(pdf_url)
+
+    pdf_bytes = _RUNTIME_PDF_CACHE.get(pdf_url)
+
+    if pdf_bytes is None:
+        try:
+            session = make_session()
+            try:
+                head = session.head(pdf_url, timeout=10, allow_redirects=True)
+                cl = head.headers.get("content-length")
+                if cl:
+                    try:
+                        if int(cl) > MAX_PDF_SEND_BYTES:
+                            return send_telegram(token, chat_id, truncate_telegram(full_message))
+                    except (TypeError, ValueError):
+                        pass
+            except Exception:
+                pass
+
+            response = session.get(pdf_url, timeout=30)
+            if response.status_code == 200:
+                content = response.content
+                content_type = response.headers.get("content-type", "").lower()
+                if (is_pdf(pdf_url) or "application/pdf" in content_type) and len(content) <= MAX_PDF_SEND_BYTES:
+                    pdf_bytes = content
+                    _RUNTIME_PDF_CACHE[pdf_url] = content
+        except Exception as exc:
+            print(f"[WARN] PDF download for send failed: {exc}", file=sys.stderr)
+
+    if not pdf_bytes:
+        return send_telegram(token, chat_id, truncate_telegram(full_message))
+
+    caption = full_message
+    if len(caption) > TELEGRAM_CAPTION_LIMIT:
+        caption = caption[:TELEGRAM_CAPTION_LIMIT]
+        last_nl = caption.rfind("\n")
+        if last_nl > TELEGRAM_CAPTION_LIMIT * 0.7:
+            caption = caption[:last_nl]
+        caption = caption.rstrip()
+
+    return send_telegram_document(token, chat_id, pdf_bytes, filename, caption=caption)
+
+
 # ---------------------------------------------------------------------------
 # Message formatting
 # ---------------------------------------------------------------------------
 
 CATEGORY_EMOJI = {
-    "vacancy": "💼",
-    "result": "📊",
-    "admit_card": "🎫",
-    "answer_key": "🔑",
-    "admission": "🎓",
-    "counselling": "🎯",
-    "scholarship": "🎓",
-    "exam_schedule": "📅",
-    "tender": "📑",
-    "gazette": "📰",
-    "land_revenue": "🏞️",
-    "press_release": "📢",
-    "announcement": "📣",
-    "publication": "📚",
-    "notice": "📌",
-    "other": "📎",
+    "vacancy": "💼", "result": "📊", "admit_card": "🎫",
+    "answer_key": "🔑", "admission": "🎓", "counselling": "🎯",
+    "scholarship": "🎓", "exam_schedule": "📅", "tender": "📑",
+    "gazette": "📰", "land_revenue": "🏞️", "press_release": "📢",
+    "announcement": "📣", "publication": "📚", "notice": "📌", "other": "📎",
 }
 
 
@@ -1609,8 +1783,7 @@ _LABELS_HI = {
     "paper_code": "पेपर कोड", "practical_dates": "प्रैक्टिकल तारीख़ें",
     "viva_dates": "वाइवा तारीख़ें",
     "tender_no": "निविदा संख्या", "tender_type": "निविदा प्रकार",
-    "work_description": "कार्य विवरण",
-    "estimated_cost": "अनुमानित लागत",
+    "work_description": "कार्य विवरण", "estimated_cost": "अनुमानित लागत",
     "emd_amount": "EMD / बयाना राशि", "emd_mode": "EMD मोड",
     "tender_fee": "निविदा शुल्क", "tender_fee_mode": "निविदा शुल्क मोड",
     "submission_last_date": "जमा आख़िरी", "opening_date": "खोलने की तारीख़",
@@ -1713,8 +1886,7 @@ _LABELS_EN = {
     "paper_code": "Paper Code", "practical_dates": "Practical Dates",
     "viva_dates": "Viva Dates",
     "tender_no": "Tender No", "tender_type": "Tender Type",
-    "work_description": "Work Description",
-    "estimated_cost": "Estimated Cost",
+    "work_description": "Work Description", "estimated_cost": "Estimated Cost",
     "emd_amount": "EMD", "emd_mode": "EMD Mode",
     "tender_fee": "Tender Fee", "tender_fee_mode": "Fee Mode",
     "submission_last_date": "Submission Last Date", "opening_date": "Opening Date",
@@ -2114,20 +2286,13 @@ def _format_notice(lines, c):
 
 
 _FORMATTERS = {
-    "vacancy": _format_vacancy,
-    "result": _format_result,
-    "admit_card": _format_admit_card,
-    "answer_key": _format_answer_key,
-    "admission": _format_admission,
-    "counselling": _format_counselling,
-    "scholarship": _format_scholarship,
-    "exam_schedule": _format_exam_schedule,
-    "tender": _format_tender,
-    "gazette": _format_gazette,
-    "land_revenue": _format_land_revenue,
-    "press_release": _format_press_release,
-    "announcement": _format_announcement,
-    "publication": _format_publication,
+    "vacancy": _format_vacancy, "result": _format_result,
+    "admit_card": _format_admit_card, "answer_key": _format_answer_key,
+    "admission": _format_admission, "counselling": _format_counselling,
+    "scholarship": _format_scholarship, "exam_schedule": _format_exam_schedule,
+    "tender": _format_tender, "gazette": _format_gazette,
+    "land_revenue": _format_land_revenue, "press_release": _format_press_release,
+    "announcement": _format_announcement, "publication": _format_publication,
     "notice": _format_notice,
 }
 
@@ -2144,9 +2309,18 @@ def format_message(site, item, classification=None):
     category = (classification.get("category") or "notice").lower()
     emoji = CATEGORY_EMOJI.get(category, "📌")
 
-    ocr_marker = " 🔍" if item.get("ocr_used") else ""
+    # OCR method marker
+    ocr_method = item.get("pdf_method", "")
+    if ocr_method == "gemini":
+        ocr_marker = " 🔍G"
+    elif ocr_method == "tesseract":
+        ocr_marker = " 🔍T"
+    else:
+        ocr_marker = ""
 
-    lines = [f"🔔 <b>{site_name}</b>", "", f"<b>{title}</b>{ocr_marker}", ""]
+    pdf_marker = " 📄" if item.get("is_pdf") else ""
+
+    lines = [f"🔔 <b>{site_name}</b>{pdf_marker}", "", f"<b>{title}</b>{ocr_marker}", ""]
     if summary:
         lines.append(summary)
         lines.append("")
@@ -2213,11 +2387,6 @@ def refresh_stats(state):
 # ---------------------------------------------------------------------------
 
 def _fetch_pdfs_for_batch(batch, scan):
-    """
-    Fetch PDF text with low parallelism — OCR is CPU-bound, so
-    default is sequential (OCR_MAX_WORKERS=1). Non-OCR PDFs still
-    work quickly because pdfplumber is fast.
-    """
     targets = [
         (iid, record)
         for iid, record in batch
@@ -2232,10 +2401,10 @@ def _fetch_pdfs_for_batch(batch, scan):
 
     def _fetch_one(record):
         try:
-            return download_pdf_text(make_session(), record["url"], timeout)
+            return download_pdf_content(record["url"], timeout)
         except Exception as exc:
             print(f"[WARN] PDF fetch error: {exc}", file=sys.stderr)
-            return "", False
+            return None, "", False, "error"
 
     workers = max(1, min(OCR_MAX_WORKERS, len(targets)))
     with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -2243,10 +2412,11 @@ def _fetch_pdfs_for_batch(batch, scan):
         for fut in as_completed(futures):
             iid, record = futures[fut]
             try:
-                text, ocr_used = fut.result()
+                content, text, ocr_used, method = fut.result()
             except Exception:
-                text, ocr_used = "", False
+                content, text, ocr_used, method = None, "", False, "error"
             record["pdf_attempts"] = int(record.get("pdf_attempts", 0)) + 1
+            record["pdf_method"] = method
             if text:
                 record["pdf_text"] = text[:MAX_PDF_TEXT_CHARS]
                 record["pdf_extracted"] = True
@@ -2266,7 +2436,10 @@ def _parse_upload_date(raw):
 
 
 def main():
-    global STALE_NOTICE_DAYS
+    global STALE_NOTICE_DAYS, _RUNTIME_PDF_CACHE, _GEMINI_API_KEY
+
+    _RUNTIME_PDF_CACHE = {}
+
     try:
         cfg = get_config()
         state = load_state()
@@ -2277,6 +2450,10 @@ def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+
+    # Set global for OCR functions
+    _GEMINI_API_KEY = gemini_key
+
     if not token or not chat_id or not gemini_key:
         print("[FATAL] TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID and GEMINI_API_KEY are required.", file=sys.stderr)
         return 2
@@ -2340,7 +2517,7 @@ def main():
                     "status": "baseline", "attempts": 0, "summary": "",
                     "classification": None, "pdf_extracted": False,
                     "pdf_text": "", "pdf_attempts": 0, "ocr_used": False,
-                    "telegram_attempts": 0,
+                    "pdf_method": "", "telegram_attempts": 0, "pdf_sent": False,
                     "upload_date": candidate.get("upload_date"),
                     "last_error": None,
                 })
@@ -2374,7 +2551,7 @@ def main():
                         "status": "baseline", "attempts": 0, "summary": "",
                         "classification": None, "pdf_extracted": False,
                         "pdf_text": "", "pdf_attempts": 0, "ocr_used": False,
-                        "telegram_attempts": 0,
+                        "pdf_method": "", "telegram_attempts": 0, "pdf_sent": False,
                         "upload_date": candidate.get("upload_date"),
                         "last_error": f"Stale (limit={STALE_NOTICE_DAYS}d)",
                     }
@@ -2390,7 +2567,7 @@ def main():
                     "status": "pending", "attempts": 0, "summary": "",
                     "classification": None, "pdf_extracted": False,
                     "pdf_text": "", "pdf_attempts": 0, "ocr_used": False,
-                    "telegram_attempts": 0,
+                    "pdf_method": "", "telegram_attempts": 0, "pdf_sent": False,
                     "upload_date": candidate.get("upload_date"),
                     "last_error": None,
                 }
@@ -2470,8 +2647,18 @@ def main():
             record["status"] = "permanent_error"
             record["last_error"] = "Configured site no longer exists"
             continue
-        message = truncate_telegram(format_message(site, record, record.get("classification")))
-        ok, permanent, detail = send_telegram(token, chat_id, message)
+
+        full_message = format_message(site, record, record.get("classification"))
+        full_message = truncate_telegram(full_message)
+
+        is_pdf_flag = record.get("is_pdf", False)
+        if SEND_PDF_ENABLED and is_pdf_flag:
+            ok, permanent, detail = send_notification_with_pdf(
+                token, chat_id, record, full_message
+            )
+        else:
+            ok, permanent, detail = send_telegram(token, chat_id, full_message)
+
         record["telegram_attempts"] = int(record.get("telegram_attempts", 0)) + 1
         if ok:
             record["status"] = "sent"
@@ -2487,6 +2674,8 @@ def main():
             record["last_error"] = detail
             run_errors += 1
             print(f"[WARN] Telegram delivery failed; will retry: {detail}", file=sys.stderr)
+
+    _RUNTIME_PDF_CACHE.clear()
 
     state["stats"]["errors"] = int(state["stats"].get("errors", 0)) + run_errors
     refresh_stats(state)
