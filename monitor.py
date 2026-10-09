@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import base64
 import hashlib
 import html
@@ -12,23 +13,26 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urljoin, urlparse, urlunparse, unquote
+from urllib.parse import urljoin, urlparse, urlunparse, unquote, parse_qsl, urlencode
 
 import pdfplumber
 import requests
 from bs4 import BeautifulSoup
 from rapidfuzz import fuzz
+from rapidfuzz.distance import Levenshtein
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# ⭐ RapidOCR — replaces Tesseract
+try:
+    import fitz
+except ImportError:
+    fitz = None
+
 try:
     from rapidocr_onnxruntime import RapidOCR
-    import fitz  # PyMuPDF — PDF → image conversion
     _RAPIDOCR_AVAILABLE = True
 except ImportError:
     RapidOCR = None
-    fitz = None
     _RAPIDOCR_AVAILABLE = False
 
 
@@ -36,13 +40,22 @@ BASE = Path(__file__).resolve().parent
 CONFIG_FILE = BASE / "websites.json"
 STATE_FILE = BASE / "state.json"
 
-# Ultimate fallback if discovery fails
 FALLBACK_MODELS = [
     "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
 ]
 
-FUZZY_DUPLICATE_THRESHOLD = 97
+# Conservative title matching: URLs/paths still carry weight, but HTML/PDF
+# representations of the same notice can live at completely different paths.
+# Raised to 96 so distinct-but-similar titles (e.g. "... 2026" vs "... 2027")
+# are not merged. A dedicated digits-only guard in find_fuzzy_match handles
+# the remaining year/serial cases regardless of fuzzy ratio.
+FUZZY_DUPLICATE_THRESHOLD = 96
+FUZZY_CROSS_PATH_THRESHOLD = 96
+TELEGRAM_MAX_ATTEMPTS = 100
+TELEGRAM_RETRY_WINDOW_HOURS = 72
+TELEGRAM_RETRY_BASE_MINUTES = 20
+TELEGRAM_RETRY_MAX_MINUTES = 360
 
 MAX_PDF_SEND_BYTES = 45 * 1024 * 1024
 MAX_GEMINI_PDF_BYTES = 18 * 1024 * 1024
@@ -56,7 +69,6 @@ _RUNTIME_PDF_CACHE_MAX_ITEMS = 50
 
 GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "16384"))
 
-# ⭐ OCR (RapidOCR) settings
 OCR_ENABLED = os.getenv("OCR_ENABLED", "true").strip().lower() == "true"
 OCR_DPI = int(os.getenv("OCR_DPI", "150"))
 OCR_MIN_TEXT_CHARS = int(os.getenv("OCR_MIN_TEXT_CHARS", "200"))
@@ -64,7 +76,6 @@ OCR_MAX_WORKERS = int(os.getenv("OCR_MAX_WORKERS", "2"))
 _OCR_MAX_PAGES = int(os.getenv("OCR_MAX_PAGES", "4"))
 
 GEMINI_PDF_OCR_ENABLED = os.getenv("GEMINI_PDF_OCR_ENABLED", "true").strip().lower() == "true"
-
 SEND_PDF_ENABLED = os.getenv("SEND_PDF_ENABLED", "true").strip().lower() == "true"
 
 NOTIFY_LANGUAGE = os.getenv("NOTIFY_LANGUAGE", "both").strip().lower()
@@ -72,10 +83,12 @@ if NOTIFY_LANGUAGE not in {"both", "hi", "en"}:
     NOTIFY_LANGUAGE = "both"
 
 STALE_NOTICE_DAYS = int(os.getenv("STALE_NOTICE_DAYS", "10"))
+OLD_YEAR_HINT_YEARS_BACK = int(os.getenv("OLD_YEAR_HINT_YEARS_BACK", "2"))
+ETAG_CHECK_MAX_AGE_DAYS = int(os.getenv("ETAG_CHECK_MAX_AGE_DAYS", "14"))
 
 USER_AGENT = os.getenv(
     "MONITOR_USER_AGENT",
-    "Mozilla/5.0 (compatible; JharkhandNoticeMonitor/9.0)"
+    "Mozilla/5.0 (compatible; JharkhandNoticeMonitor/9.3)"
 )
 
 STRONG_KEYWORDS = [
@@ -90,18 +103,15 @@ STRONG_KEYWORDS = [
 _RUNTIME_PDF_CACHE: Dict[str, bytes] = {}
 _GEMINI_API_KEY = ""
 
-# ⭐ Dynamic model state
 _MODELS_DISCOVERED: bool = False
 _DYNAMIC_MODELS: List[str] = []
 _DEAD_MODELS: set = set()
 _GEMINI_QUOTA_EXHAUSTED: bool = False
 
-# Lazy-loaded RapidOCR instance
 _RAPIDOCR_INSTANCE = None
 
 
 def _get_rapidocr():
-    """Lazy init RapidOCR (heavy model load)."""
     global _RAPIDOCR_INSTANCE
     if _RAPIDOCR_INSTANCE is None and _RAPIDOCR_AVAILABLE:
         try:
@@ -125,7 +135,6 @@ def _cache_put(url, content):
 
 
 def _discover_models():
-    """Dynamically fetch available Gemini models from API."""
     global _MODELS_DISCOVERED, _DYNAMIC_MODELS
 
     if _MODELS_DISCOVERED:
@@ -176,6 +185,314 @@ def _discover_models():
         _DYNAMIC_MODELS = list(FALLBACK_MODELS)
 
     _MODELS_DISCOVERED = True
+
+
+def _pdf_content_fingerprint(content):
+    """Fingerprint rendered PDF pages so metadata-only re-exports do not look changed.
+
+    Uses low-resolution rendered pixels (including scanned/image-only PDFs) and ignores
+    PDF metadata such as CreationDate/Producer. Falls back to normalized extracted text,
+    then raw bytes only when neither rendering nor text extraction is available.
+    """
+    if not content:
+        return ""
+    if fitz is not None:
+        try:
+            digest = hashlib.sha256()
+            with fitz.open(stream=content, filetype="pdf") as doc:
+                for page in doc[:MAX_PDF_PAGES]:
+                    pix = page.get_pixmap(
+                        matrix=fitz.Matrix(0.75, 0.75),
+                        colorspace=fitz.csGRAY,
+                        alpha=False,
+                    )
+                    digest.update(f"{pix.width}x{pix.height}:".encode("ascii"))
+                    digest.update(pix.samples)
+            return "visual-v1:" + digest.hexdigest()
+        except Exception as exc:
+            print(f"[WARN] PDF visual fingerprint failed: {exc}", file=sys.stderr)
+    try:
+        text = _extract_pdf_text_plumber(content)
+        normalized = re.sub(r"\s+", " ", text or "").strip().casefold()
+        if len(normalized) >= 30:
+            return "text-v1:" + hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    except Exception as exc:
+        print(f"[WARN] PDF text fingerprint failed: {exc}", file=sys.stderr)
+    return "bytes-v1:" + hashlib.sha256(content).hexdigest()
+
+
+def _parse_utc_timestamp(value):
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _telegram_retry_due(record, now=None):
+    """Return False while a failed Telegram delivery is in its backoff window."""
+    now = now or datetime.now(timezone.utc)
+    first_failed = _parse_utc_timestamp(record.get("telegram_first_failed_at"))
+    if first_failed and (now - first_failed).total_seconds() > TELEGRAM_RETRY_WINDOW_HOURS * 3600:
+        return False
+    next_attempt = _parse_utc_timestamp(record.get("telegram_next_attempt_at"))
+    return next_attempt is None or next_attempt <= now
+
+
+def _schedule_telegram_retry(record, now=None):
+    """Persist bounded exponential retry timing across scheduled workflow runs."""
+    now = now or datetime.now(timezone.utc)
+    if not record.get("telegram_first_failed_at"):
+        record["telegram_first_failed_at"] = now.isoformat()
+    attempts = max(1, int(record.get("telegram_attempts", 1) or 1))
+    delay_minutes = min(
+        TELEGRAM_RETRY_BASE_MINUTES * (2 ** min(attempts - 1, 8)),
+        TELEGRAM_RETRY_MAX_MINUTES,
+    )
+    record["telegram_next_attempt_at"] = (now + timedelta(minutes=delay_minutes)).isoformat()
+
+
+def _meaningful_metadata_change(old_title, new_title, old_context, new_context):
+    """Ignore whitespace/punctuation/short snippet churn, but reprocess substantive edits."""
+    old_t = re.sub(r"[^\w]+", " ", (old_title or "").casefold()).strip()
+    new_t = re.sub(r"[^\w]+", " ", (new_title or "").casefold()).strip()
+    if old_t and new_t and old_t != new_t:
+        distance = Levenshtein.distance(old_t, new_t)
+        ratio = fuzz.ratio(old_t, new_t)
+        if distance >= 8 and ratio < 92:
+            return True
+
+    old_c = re.sub(r"\s+", " ", (old_context or "").casefold()).strip()
+    new_c = re.sub(r"\s+", " ", (new_context or "").casefold()).strip()
+    if old_c and new_c and old_c != new_c:
+        distance = Levenshtein.distance(old_c, new_c)
+        ratio = fuzz.ratio(old_c, new_c)
+        if distance >= 30 and ratio < 78:
+            return True
+    return False
+
+
+def _check_url_changed(session, url, record):
+    """Cheap HEAD check using ETag/Last-Modified for silent content changes."""
+    try:
+        head = session.head(url, timeout=8, allow_redirects=True)
+        new_etag = head.headers.get("etag")
+        new_lm = head.headers.get("last-modified")
+
+        old_etag = record.get("etag")
+        old_lm = record.get("last_modified")
+
+        changed = False
+        if new_etag and old_etag and new_etag != old_etag:
+            changed = True
+        elif new_lm and old_lm and new_lm != old_lm:
+            changed = True
+
+        # PDF ETag/Last-Modified headers are only hints: some servers keep them
+        # unchanged even when the PDF content changes, while others regenerate PDF
+        # metadata without changing the visible notice. Therefore fingerprint every
+        # PDF during this scheduled validator check (currently throttled by
+        # ETAG_CHECK_MAX_AGE_DAYS at the call site) and use comparable fingerprints
+        # as the source of truth. If download/fingerprinting fails, retain the header
+        # signal rather than falsely claiming that the PDF is unchanged.
+        if record.get("is_pdf"):
+            try:
+                with session.get(url, timeout=20, allow_redirects=True, stream=True) as response:
+                    if response.status_code < 400:
+                        chunks = []
+                        total = 0
+                        prefix = b""
+                        too_large = False
+                        for chunk in response.iter_content(chunk_size=64 * 1024):
+                            if not chunk:
+                                continue
+                            if len(prefix) < 8:
+                                prefix += chunk[:8 - len(prefix)]
+                            total += len(chunk)
+                            if total > MAX_PDF_SEND_BYTES:
+                                too_large = True
+                                break
+                            chunks.append(chunk)
+                        if not too_large and prefix.startswith(b"%PDF"):
+                            content = b"".join(chunks)
+                            new_hash = _pdf_content_fingerprint(content)
+                            old_hash = record.get("pdf_hash")
+                            old_kind = record.get("pdf_hash_kind")
+                            new_kind = new_hash.split(":", 1)[0]
+                            if old_hash and old_kind == new_kind:
+                                # Semantic fingerprints supersede metadata headers.
+                                changed = new_hash != old_hash
+                            elif old_hash and not old_kind:
+                                # Legacy state stored raw-byte SHA-256. Do not emit a
+                                # one-time false alert during fingerprint migration.
+                                changed = False
+                            # If there is no comparable previous fingerprint, retain
+                            # the ETag/Last-Modified signal; save the new baseline below.
+                            record["pdf_hash"] = new_hash
+                            record["pdf_hash_kind"] = new_kind
+            except Exception as exc:
+                print(f"[WARN] PDF hash check failed for {url[:80]}: {exc}", file=sys.stderr)
+
+        return changed, new_etag, new_lm
+    except Exception:
+        return False, None, None
+
+
+# ---------------------------------------------------------------------------
+# URL filters
+# ---------------------------------------------------------------------------
+
+_NON_NOTICE_URL_PATTERNS = [
+    re.compile(r"/page/\d+/?$", re.I),
+    re.compile(r"/page/?$", re.I),
+    re.compile(r"/notice_category(/|$)", re.I),
+    re.compile(r"/notice-category(/|$)", re.I),
+    re.compile(r"/document-category(/|$)", re.I),
+    re.compile(r"/document_category(/|$)", re.I),
+    re.compile(r"/past-notices(/|$)", re.I),
+    re.compile(r"/past_notices(/|$)", re.I),
+    re.compile(r"/whats-new(/|$)", re.I),
+    re.compile(r"/whats_new(/|$)", re.I),
+    re.compile(r"/category/[^/]+/?$", re.I),
+    re.compile(r"/tag/[^/]+/?$", re.I),
+    re.compile(r"/archive/?$", re.I),
+    re.compile(r"/search(/|$)", re.I),
+    re.compile(r"[?&]page=\d+", re.I),
+    re.compile(r"[?&]paged=\d+", re.I),
+    re.compile(r"/(hi|en|hn|ur|bn|ta|te|mr|gu|kn|ml|pa|or|as)(/|$).*(past[-_]?notices|whats[-_]?new|archive|category|notice[-_]?category|document[-_]?category|search)", re.I),
+    re.compile(r"/(hi|en|hn|ur|bn|ta|te|mr|gu|kn|ml|pa|or|as)/?$", re.I),
+]
+
+_ARCHIVE_URL_PATTERNS = [
+    re.compile(r"/past-notices(/|$)", re.I),
+    re.compile(r"/past_notices(/|$)", re.I),
+    re.compile(r"/whats-new(/|$)", re.I),
+    re.compile(r"/whats_new(/|$)", re.I),
+    re.compile(r"/notice_category(/|$)", re.I),
+    re.compile(r"/notice-category(/|$)", re.I),
+    re.compile(r"/document-category(/|$)", re.I),
+    re.compile(r"/document_category(/|$)", re.I),
+    re.compile(r"/archive/?$", re.I),
+    re.compile(r"/page/\d+/?$", re.I),
+    re.compile(r"/page/?$", re.I),
+    re.compile(r"[?&]page=\d+", re.I),
+    re.compile(r"[?&]paged=\d+", re.I),
+]
+
+_GENERIC_TITLES = {
+    "archive", "more", "more...", "more…", "more....",
+    "»", "«", ">>", "<<", "next", "previous", "prev",
+    "back", "forward", "home", "contact", "about",
+    "about us", "contact us", "read more", "view more",
+    "click here", "here", "link",
+}
+
+_LANGUAGE_SELECTOR_TITLES = {
+    "hindi", "english", "santali", "santhali", "urdu", "bengali",
+    "bangla", "odia", "oriya", "tamil", "telugu", "marathi",
+    "gujarati", "kannada", "malayalam", "punjabi", "assamese",
+    "kashmiri", "konkani", "manipuri", "nepali", "sanskrit",
+    "sindhi", "bodo", "dogri", "maithili", "rajasthani",
+    "हिन्दी", "हिंदी", "हिन्दी में", "हिंदी में",
+    "अंग्रेजी", "अंग्रेज़ी", "अंग्रेजी में",
+    "संताली", "संथाली", "उर्दू", "बंगाली", "बांग्ला",
+    "उड़िया", "ओड़िया", "तमिल", "तेलुगु", "मराठी",
+    "गुजराती", "कन्नड़", "मलयालम", "पंजाबी", "असमिया",
+    "कश्मीरी", "कोंकणी", "मणिपुरी", "नेपाली", "संस्कृत",
+    "सिंधी", "बोडो", "डोगरी", "मैथिली", "राजस्थानी",
+}
+
+_EMPTY_PAGE_PHRASES = [
+    "sorry, no notice matched",
+    "no notice matched this category",
+    "no records found",
+    "no data found",
+    "no notices found",
+    "no results found",
+]
+
+
+def _is_navigation_url(url):
+    """Blocks URL from becoming a notice candidate."""
+    try:
+        parsed = urlparse(url)
+        target = (parsed.path or "") + ("?" + parsed.query if parsed.query else "")
+    except Exception:
+        return False
+    for pat in _NON_NOTICE_URL_PATTERNS:
+        if pat.search(target):
+            return True
+    return False
+
+
+def _is_archive_url(url):
+    """Archive/listing/pagination URL — FETCH allowed, but
+    individual notices inside will become candidates."""
+    try:
+        parsed = urlparse(url)
+        target = (parsed.path or "") + ("?" + parsed.query if parsed.query else "")
+    except Exception:
+        return False
+    for pat in _ARCHIVE_URL_PATTERNS:
+        if pat.search(target):
+            return True
+    return False
+
+
+def _is_generic_title(title):
+    t = (title or "").strip().lower()
+    if not t:
+        return True
+    if t in _GENERIC_TITLES:
+        return True
+    if t.isdigit() and len(t) <= 3:
+        return True
+    if len(t) <= 2 and not any(c.isalnum() for c in t):
+        return True
+    return False
+
+
+def _is_language_selector(title):
+    t = (title or "").strip().lower()
+    if not t:
+        return False
+    if t in _LANGUAGE_SELECTOR_TITLES:
+        return True
+    for sep in (" - ", " | ", " / ", "(", ")"):
+        for part in t.split(sep):
+            p = part.strip()
+            if p and p in _LANGUAGE_SELECTOR_TITLES and len(t) <= 40:
+                return True
+    return False
+
+
+def _is_empty_page_text(html_text):
+    if not html_text:
+        return False
+    sample = html_text[:8000].lower()
+    return any(phrase in sample for phrase in _EMPTY_PAGE_PHRASES)
+
+
+def _title_from_url(url, min_len=8):
+    try:
+        path = unquote(urlparse(url).path or "")
+    except Exception:
+        return ""
+    slug = path.rstrip("/").rsplit("/", 1)[-1]
+    if not slug or slug.lower().endswith(".pdf"):
+        slug = slug.rsplit(".", 1)[0] if "." in slug else slug
+    slug = re.sub(r"[-_]+", " ", slug)
+    slug = re.sub(r"\s+", " ", slug).strip()
+    slug = clean_text(slug, 200)
+    if len(slug) < min_len:
+        return ""
+    if _is_generic_title(slug):
+        return ""
+    return slug
 
 
 # ---------------------------------------------------------------------------
@@ -420,128 +737,6 @@ def _download_with_pdf_resolution(session, url, timeout, depth=0, _visited=None)
 
 
 # ---------------------------------------------------------------------------
-# Navigation filters
-# ---------------------------------------------------------------------------
-
-_NON_NOTICE_URL_PATTERNS = [
-    re.compile(r"/page/\d+/?$", re.I),
-    re.compile(r"/page/?$", re.I),
-    re.compile(r"/notice_category(/|$)", re.I),
-    re.compile(r"/notice-category(/|$)", re.I),
-    re.compile(r"/document-category(/|$)", re.I),
-    re.compile(r"/document_category(/|$)", re.I),
-    re.compile(r"/past-notices(/|$)", re.I),
-    re.compile(r"/past_notices(/|$)", re.I),
-    re.compile(r"/whats-new(/|$)", re.I),
-    re.compile(r"/whats_new(/|$)", re.I),
-    re.compile(r"/category/[^/]+/?$", re.I),
-    re.compile(r"/tag/[^/]+/?$", re.I),
-    re.compile(r"/archive/?$", re.I),
-    re.compile(r"/search(/|$)", re.I),
-    re.compile(r"[?&]page=\d+", re.I),
-    re.compile(r"[?&]paged=\d+", re.I),
-    re.compile(r"/(hi|en|hn|ur|bn|ta|te|mr|gu|kn|ml|pa|or|as)(/|$).*(past[-_]?notices|whats[-_]?new|archive|category|notice[-_]?category|document[-_]?category|search)", re.I),
-    re.compile(r"/(hi|en|hn|ur|bn|ta|te|mr|gu|kn|ml|pa|or|as)/?$", re.I),
-]
-
-_GENERIC_TITLES = {
-    "archive", "more", "more...", "more…", "more....",
-    "»", "«", ">>", "<<", "next", "previous", "prev",
-    "back", "forward", "home", "contact", "about",
-    "about us", "contact us", "read more", "view more",
-    "click here", "here", "link",
-}
-
-_LANGUAGE_SELECTOR_TITLES = {
-    "hindi", "english", "santali", "santhali", "urdu", "bengali",
-    "bangla", "odia", "oriya", "tamil", "telugu", "marathi",
-    "gujarati", "kannada", "malayalam", "punjabi", "assamese",
-    "kashmiri", "konkani", "manipuri", "nepali", "sanskrit",
-    "sindhi", "bodo", "dogri", "maithili", "rajasthani",
-    "हिन्दी", "हिंदी", "हिन्दी में", "हिंदी में",
-    "अंग्रेजी", "अंग्रेज़ी", "अंग्रेजी में",
-    "संताली", "संथाली", "उर्दू", "बंगाली", "बांग्ला",
-    "उड़िया", "ओड़िया", "तमिल", "तेलुगु", "मराठी",
-    "गुजराती", "कन्नड़", "मलयालम", "पंजाबी", "असमिया",
-    "कश्मीरी", "कोंकणी", "मणिपुरी", "नेपाली", "संस्कृत",
-    "सिंधी", "बोडो", "डोगरी", "मैथिली", "राजस्थानी",
-}
-
-_EMPTY_PAGE_PHRASES = [
-    "sorry, no notice matched",
-    "no notice matched this category",
-    "no records found",
-    "no data found",
-    "no notices found",
-    "no results found",
-]
-
-
-def _is_navigation_url(url):
-    try:
-        parsed = urlparse(url)
-        target = (parsed.path or "") + ("?" + parsed.query if parsed.query else "")
-    except Exception:
-        return False
-    for pat in _NON_NOTICE_URL_PATTERNS:
-        if pat.search(target):
-            return True
-    return False
-
-
-def _is_generic_title(title):
-    t = (title or "").strip().lower()
-    if not t:
-        return True
-    if t in _GENERIC_TITLES:
-        return True
-    if t.isdigit() and len(t) <= 3:
-        return True
-    if len(t) <= 2 and not any(c.isalnum() for c in t):
-        return True
-    return False
-
-
-def _is_language_selector(title):
-    t = (title or "").strip().lower()
-    if not t:
-        return False
-    if t in _LANGUAGE_SELECTOR_TITLES:
-        return True
-    for sep in (" - ", " | ", " / ", "(", ")"):
-        for part in t.split(sep):
-            p = part.strip()
-            if p and p in _LANGUAGE_SELECTOR_TITLES and len(t) <= 40:
-                return True
-    return False
-
-
-def _is_empty_page_text(html_text):
-    if not html_text:
-        return False
-    sample = html_text[:8000].lower()
-    return any(phrase in sample for phrase in _EMPTY_PAGE_PHRASES)
-
-
-def _title_from_url(url, min_len=8):
-    try:
-        path = unquote(urlparse(url).path or "")
-    except Exception:
-        return ""
-    slug = path.rstrip("/").rsplit("/", 1)[-1]
-    if not slug or slug.lower().endswith(".pdf"):
-        slug = slug.rsplit(".", 1)[0] if "." in slug else slug
-    slug = re.sub(r"[-_]+", " ", slug)
-    slug = re.sub(r"\s+", " ", slug).strip()
-    slug = clean_text(slug, 200)
-    if len(slug) < min_len:
-        return ""
-    if _is_generic_title(slug):
-        return ""
-    return slug
-
-
-# ---------------------------------------------------------------------------
 # Dates
 # ---------------------------------------------------------------------------
 
@@ -610,6 +805,18 @@ _UPLOAD_DATE_TEXT_PATTERNS = [
 ]
 
 
+def _extract_explicit_issue_dates(text):
+    """Only dates explicitly labelled as publication/issue dates count as stale evidence."""
+    if not text:
+        return []
+    dates = []
+    for pattern in _UPLOAD_DATE_TEXT_PATTERNS:
+        for match in pattern.finditer(text):
+            dates.extend(_extract_full_dates(match.group(1)))
+    # Stable de-duplication of date values.
+    return sorted(set(dates))
+
+
 def _extract_upload_date(anchor_tag):
     try:
         search_root = (
@@ -648,7 +855,7 @@ def _extract_upload_date(anchor_tag):
     return None
 
 
-def _is_stale_notice(title, context, url, upload_date=None):
+def _is_stale_notice(title, context, url, upload_date=None, pdf_text=None):
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=STALE_NOTICE_DAYS)
 
@@ -662,7 +869,13 @@ def _is_stale_notice(title, context, url, upload_date=None):
     haystack = f"{title} {context} {url}".strip()
     candidate_dates.extend(_extract_full_dates(haystack))
 
+    if pdf_text:
+        candidate_dates.extend(_extract_full_dates(pdf_text))
+
     if not candidate_dates:
+        # A year appearing in a title/URL (e.g. "2023 batch revised in 2026") is
+        # not a reliable publication date. Without a full, parseable date, do not
+        # reject the notice based on a bare year; false negatives are worse here.
         return False
 
     past_dates = [d for d in candidate_dates if d <= now]
@@ -696,22 +909,56 @@ def load_json(path, default):
         raise RuntimeError(f"Invalid JSON in {path.name}: {exc}") from exc
 
 
-def atomic_save_json(path, data):
+def atomic_save_json(path, data, max_bytes=None):
+    """Atomically persist JSON; reject oversized state before replacing old state."""
     tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-        f.write("\n")
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    try:
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        if max_bytes is not None:
+            size = tmp.stat().st_size
+            if size > max_bytes:
+                raise RuntimeError(f"Serialized state exceeds byte cap: {size} > {max_bytes}")
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def canonical_url(raw):
+    """Normalize host/scheme and fragment without altering functional query parameters."""
     raw = (raw or "").strip()
     p = urlparse(raw)
     if not p.scheme or not p.netloc:
         return raw
+    # Keep original query order: some signed/download URLs may be order-sensitive.
     return urlunparse((p.scheme.lower(), p.netloc.lower(), p.path or "/", "", p.query, ""))
+
+
+def canonical_identity_url(raw):
+    """Deduplication key: remove common trackers and language selectors only for identity."""
+    normalized = canonical_url(raw)
+    p = urlparse(normalized)
+    if not p.scheme or not p.netloc:
+        return normalized
+    tracking_exact = {
+        "fbclid", "gclid", "dclid", "msclkid", "yclid", "mc_cid", "mc_eid",
+        "ref", "referrer", "lang", "language", "_ga", "_gl", "igshid",
+    }
+    pairs = []
+    for key, value in parse_qsl(p.query, keep_blank_values=True):
+        key_lower = key.casefold()
+        if key_lower in tracking_exact or key_lower.startswith("utm_"):
+            continue
+        pairs.append((key, value))
+    pairs.sort(key=lambda pair: (pair[0].casefold(), pair[1]))
+    return urlunparse((p.scheme.lower(), p.netloc.lower(), p.path or "/", "", urlencode(pairs, doseq=True), ""))
 
 
 def same_host(a, b):
@@ -761,13 +1008,20 @@ def get_config():
         "request_timeout_seconds": 25,
         "max_workers": 10,
         "max_items_per_site": 100,
-        "max_discovery_pages_per_site": 5,
+        "max_discovery_pages_per_site": 10,
+        "max_archive_pages_per_site": 12,
+        "max_pagination_per_archive": 3,
         "max_new_items_per_run": 25,
         "gemini_batch_size": 3,
         "gemini_max_calls_per_run": 15,
         "retention_days": 90,
-        "max_pending_attempts": 12,
+        "max_state_items": 3000,
+        "max_state_bytes": 3000000,
+        "max_pending_attempts": 72,
         "stale_notice_days": 10,
+        "site_alert_threshold": 3,
+        "site_alert_cooldown_hours": 6,
+        "site_empty_scan_threshold_runs": 72,
         "keywords": [],
         "discovery_keywords": [],
         "sitemap_enabled": True,
@@ -779,12 +1033,19 @@ def get_config():
     scan["max_workers"] = max(1, int(scan["max_workers"]))
     scan["max_items_per_site"] = max(1, int(scan["max_items_per_site"]))
     scan["max_discovery_pages_per_site"] = max(1, int(scan["max_discovery_pages_per_site"]))
+    scan["max_archive_pages_per_site"] = max(0, int(scan["max_archive_pages_per_site"]))
+    scan["max_pagination_per_archive"] = max(0, int(scan["max_pagination_per_archive"]))
     scan["max_new_items_per_run"] = max(1, int(scan["max_new_items_per_run"]))
     scan["gemini_batch_size"] = max(1, min(20, int(scan["gemini_batch_size"])))
     scan["gemini_max_calls_per_run"] = max(1, int(scan["gemini_max_calls_per_run"]))
     scan["retention_days"] = max(7, int(scan["retention_days"]))
+    scan["max_state_items"] = max(500, min(10000, int(scan["max_state_items"])))
+    scan["max_state_bytes"] = max(500000, min(3000000, int(scan["max_state_bytes"])))
     scan["max_pending_attempts"] = max(1, int(scan["max_pending_attempts"]))
     scan["stale_notice_days"] = max(1, int(scan["stale_notice_days"]))
+    scan["site_alert_threshold"] = max(1, int(scan["site_alert_threshold"]))
+    scan["site_alert_cooldown_hours"] = max(1, int(scan["site_alert_cooldown_hours"]))
+    scan["site_empty_scan_threshold_runs"] = max(6, int(scan["site_empty_scan_threshold_runs"]))
     scan["sitemap_enabled"] = bool(scan["sitemap_enabled"])
     scan["keywords"] = [clean_text(str(x), 80).lower() for x in scan.get("keywords", []) if str(x).strip()]
     scan["discovery_keywords"] = [clean_text(str(x), 80).lower() for x in scan.get("discovery_keywords", []) if str(x).strip()]
@@ -823,7 +1084,7 @@ def get_config():
 
 def default_state():
     return {
-        "version": 21,
+        "version": 28,
         "initialized": False,
         "last_run": None,
         "items": {},
@@ -854,6 +1115,7 @@ def load_state():
                 record["status"] = "ignored"
             else:
                 record["status"] = "baseline"
+        record["_loaded_status"] = record.get("status")
         record.setdefault("attempts", 0)
         record.setdefault("last_error", None)
         record.setdefault("summary", "")
@@ -868,7 +1130,19 @@ def load_state():
         record.setdefault("upload_date", None)
         record.setdefault("first_seen", utc_now())
         record.setdefault("last_seen", record["first_seen"])
-    state["version"] = 21
+        record.setdefault("etag", None)
+        record.setdefault("last_modified", None)
+        record.setdefault("pdf_hash", None)
+        record.setdefault("pdf_hash_kind", None)
+        record.setdefault("last_content_check_at", None)
+        # Migration: older state files have no independent content-check clock.
+        # Use the last observation timestamp once, so legacy PDFs are not all
+        # downloaded on the very first run after this upgrade.
+        if not record.get("last_content_check_at"):
+            record["last_content_check_at"] = (
+                record.get("last_seen") or record.get("first_seen") or utc_now()
+            )
+    state["version"] = 28
     return state
 
 
@@ -881,6 +1155,15 @@ def site_state(state, site_id):
     s.setdefault("last_error", None)
     s.setdefault("last_error_at", None)
     s.setdefault("last_item_count", 0)
+    s.setdefault("alert_active", False)
+    s.setdefault("last_alert_at", None)
+    s.setdefault("last_recovery_at", None)
+    # Silent-site detection: a site whose baseline is complete but whose scans
+    # keep returning 0 candidates. This is how an HTML structure change
+    # manifests — pages load fine but no notices are extracted.
+    s.setdefault("consecutive_empty_scans", 0)
+    s.setdefault("empty_alert_active", False)
+    s.setdefault("last_empty_alert_at", None)
     return s
 
 
@@ -891,6 +1174,16 @@ def mark_site_success(state, site_id, count):
     s["last_error"] = None
     s["last_error_at"] = None
     s["last_item_count"] = count
+    # Only count empty scans after baseline is complete. A 0-candidate scan
+    # on the very first fetch is normal (a site may genuinely have no notices
+    # right now), but 0 candidates on a site that has previously yielded
+    # results for many consecutive runs strongly suggests the extractor no
+    # longer matches the site's HTML structure.
+    if s.get("baseline_complete"):
+        if count == 0:
+            s["consecutive_empty_scans"] = int(s.get("consecutive_empty_scans", 0)) + 1
+        else:
+            s["consecutive_empty_scans"] = 0
 
 
 def mark_site_failure(state, site_id, error):
@@ -899,6 +1192,143 @@ def mark_site_failure(state, site_id, error):
     s["total_failures"] += 1
     s["last_error"] = clean_text(error, 500)
     s["last_error_at"] = utc_now()
+
+
+def _check_and_send_site_alerts(
+    state, cfg, token, chat_id,
+    threshold=3,
+    cooldown_hours=6,
+    empty_scan_threshold=72,
+):
+    """Send consolidated failure/recovery/silent alerts; state changes only after delivery.
+
+    Three alert categories:
+
+    1. Failure alert — a site returned HTTP errors or network failures for
+       `threshold` consecutive runs.
+    2. Recovery alert — a previously failing site produced a successful scan.
+    3. Silent alert — a site with a completed baseline produced 0 candidates
+       for `empty_scan_threshold` consecutive successful runs. This is how an
+       HTML structure change manifests: pages still load but no notices are
+       extracted, so `consecutive_failures` stays at 0.
+    """
+    now = datetime.now(timezone.utc)
+    failing_candidates = []
+    recovered_candidates = []
+    empty_candidates = []
+    empty_recovered_candidates = []
+
+    for site in cfg["websites"]:
+        sid = site["id"]
+        st = site_state(state, sid)
+        failures = int(st.get("consecutive_failures", 0))
+
+        # ---- Failure / recovery ----
+        if failures >= threshold and not st.get("alert_active", False):
+            last_alert = st.get("last_alert_at")
+            cooled = True
+            if last_alert:
+                try:
+                    last_dt = datetime.fromisoformat(last_alert.replace("Z", "+00:00"))
+                    if last_dt.tzinfo is None:
+                        last_dt = last_dt.replace(tzinfo=timezone.utc)
+                    cooled = (now - last_dt).total_seconds() >= cooldown_hours * 3600
+                except Exception:
+                    cooled = True
+            if cooled:
+                failing_candidates.append((sid, site["name"], failures, st.get("last_error")))
+        elif failures == 0 and st.get("alert_active", False):
+            recovered_candidates.append((sid, site["name"]))
+
+        # ---- Silent / empty-scan ----
+        # Only evaluated for sites succeeding at the HTTP level; a failing
+        # site already produces its own alert, so we don't double-alert.
+        if st.get("baseline_complete") and failures == 0:
+            empty_scans = int(st.get("consecutive_empty_scans", 0))
+            if empty_scans >= empty_scan_threshold and not st.get("empty_alert_active", False):
+                last_empty_alert = st.get("last_empty_alert_at")
+                cooled = True
+                if last_empty_alert:
+                    try:
+                        last_dt = datetime.fromisoformat(last_empty_alert.replace("Z", "+00:00"))
+                        if last_dt.tzinfo is None:
+                            last_dt = last_dt.replace(tzinfo=timezone.utc)
+                        cooled = (now - last_dt).total_seconds() >= cooldown_hours * 3600
+                    except Exception:
+                        cooled = True
+                if cooled:
+                    empty_candidates.append((sid, site["name"], empty_scans))
+            elif empty_scans == 0 and st.get("empty_alert_active", False):
+                empty_recovered_candidates.append((sid, site["name"]))
+
+    # ---- Send failure alert ----
+    if failing_candidates:
+        lines = ["⚠️ <b>Site Failure Alert</b>", "", f"{len(failing_candidates)} site(s) failing:", ""]
+        for sid, name, count, err in failing_candidates[:10]:
+            lines.append(f"• <b>{html.escape(name)}</b> — {count} fails")
+            if err:
+                lines.append(f"  <i>{html.escape(str(err)[:100])}</i>")
+        ok, _permanent, detail = send_telegram(token, chat_id, "\n".join(lines))
+        if ok:
+            for sid, _name, _count, _err in failing_candidates:
+                st = site_state(state, sid)
+                st["alert_active"] = True
+                st["last_alert_at"] = utc_now()
+        else:
+            print(f"[WARN] Site failure alert not delivered; will retry: {detail}", file=sys.stderr)
+
+    # ---- Send failure recovery ----
+    if recovered_candidates:
+        lines = ["✅ <b>Site Recovery</b>", "", f"{len(recovered_candidates)} site(s) recovered:", ""]
+        for sid, name in recovered_candidates[:10]:
+            lines.append(f"• {html.escape(name)}")
+        ok, _permanent, detail = send_telegram(token, chat_id, "\n".join(lines))
+        if ok:
+            for sid, _name in recovered_candidates:
+                st = site_state(state, sid)
+                st["alert_active"] = False
+                st["last_recovery_at"] = utc_now()
+        else:
+            print(f"[WARN] Site recovery alert not delivered; will retry: {detail}", file=sys.stderr)
+
+    # ---- Send silent-site alert ----
+    if empty_candidates:
+        lines = [
+            "⚠️ <b>Site Silent Alert</b>",
+            "",
+            f"{len(empty_candidates)} site(s) returned 0 candidates:",
+            "",
+        ]
+        for sid, name, count in empty_candidates[:10]:
+            lines.append(f"• <b>{html.escape(name)}</b> — {count} empty scan(s)")
+        lines.append("")
+        lines.append("<i>Site HTML structure may have changed; notices are no longer being parsed.</i>")
+        ok, _permanent, detail = send_telegram(token, chat_id, "\n".join(lines))
+        if ok:
+            for sid, _name, _count in empty_candidates:
+                st = site_state(state, sid)
+                st["empty_alert_active"] = True
+                st["last_empty_alert_at"] = utc_now()
+        else:
+            print(f"[WARN] Site silent alert not delivered; will retry: {detail}", file=sys.stderr)
+
+    # ---- Send silent-site recovery ----
+    if empty_recovered_candidates:
+        lines = [
+            "✅ <b>Site Recovered (Silent)</b>",
+            "",
+            f"{len(empty_recovered_candidates)} site(s) produced candidates again:",
+            "",
+        ]
+        for sid, name in empty_recovered_candidates[:10]:
+            lines.append(f"• {html.escape(name)}")
+        ok, _permanent, detail = send_telegram(token, chat_id, "\n".join(lines))
+        if ok:
+            for sid, _name in empty_recovered_candidates:
+                st = site_state(state, sid)
+                st["empty_alert_active"] = False
+        else:
+            print(f"[WARN] Site silent recovery alert not delivered; will retry: {detail}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -910,11 +1340,23 @@ def local_score(title, url, context, keywords):
     return sum(1 for kw in keywords if kw and kw in text)
 
 
+def pending_priority(record, keywords, now=None):
+    """Score important items while aging older pending items to prevent starvation."""
+    now = now or datetime.now(timezone.utc)
+    first_seen = _parse_utc_timestamp(record.get("first_seen"))
+    age_days = max(0.0, (now - first_seen).total_seconds() / 86400) if first_seen else 0.0
+    score = local_score(
+        record.get("title", ""), record.get("url", ""), record.get("context", ""), keywords
+    )
+    age_bonus = min(age_days, 30.0)
+    return score + age_bonus, age_days
+
+
 def item_id(site_id, url, title, context=""):
     fingerprint = hashlib.sha256(
         clean_text(f"{title}|{context}", 900).lower().encode()
     ).hexdigest()[:12]
-    raw = f"{site_id}|{canonical_url(url)}|{fingerprint}"
+    raw = f"{site_id}|{canonical_identity_url(url)}|{fingerprint}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
@@ -931,37 +1373,79 @@ def _url_path_segments(url):
 
 
 def build_site_index(state):
+    """Index all records by site; prefer non-permanent records for duplicate URLs."""
     index = {}
+    permanent = {}
     for iid, record in state.get("items", {}).items():
         if not isinstance(record, dict):
-            continue
-        if record.get("status") in ("ignored", "permanent_error"):
             continue
         sid = record.get("site_id")
         if not sid:
             continue
-        index.setdefault(sid, []).append((iid, record.get("title", ""), record.get("url", "")))
+        row = (iid, record.get("title", ""), record.get("url", ""))
+        target = permanent if record.get("status") == "permanent_error" else index
+        target.setdefault(sid, []).append(row)
+    # Keep permanent_error rows available for URL matching, but after regular
+    # rows so a sent/ignored record wins if historical duplicates exist.
+    for sid, rows in permanent.items():
+        index.setdefault(sid, []).extend(rows)
     return index
 
 
+def find_url_match(site_items, url):
+    """Find an existing record by canonical URL, even when its title changed."""
+    target = canonical_identity_url(url)
+    if not target:
+        return None
+    for iid, _title, existing_url in site_items or []:
+        if canonical_identity_url(existing_url) == target:
+            return iid
+    return None
+
+
 def find_fuzzy_match(site_items, title, url):
+    """Match likely duplicate representations, including HTML pages and linked PDFs.
+
+    Path overlap permits a slightly lower title threshold. With unrelated paths,
+    require a longer, near-identical title to avoid merging unrelated notices.
+
+    A digits-only guard rejects matches where titles differ only by numbers
+    (e.g. "... 2026" vs "... 2027"), which fuzzy scoring alone would merge
+    even at high thresholds because path overlap boosts similarity.
+    """
     if not site_items or not title:
         return None
     new_title = _normalize_title(title)
     new_segs = _url_path_segments(url)
-    if not new_title:
+    if len(new_title) < 12:
         return None
+
     best = None
     best_score = 0
     for iid, existing_title, existing_url in site_items:
         existing_norm = _normalize_title(existing_title)
-        if not existing_norm:
+        if len(existing_norm) < 12:
             continue
+
+        # Hard guard: titles that differ only by digits represent distinct
+        # notices (years, serials, advertisement numbers) and must never merge.
+        new_alpha = re.sub(r"\d+", "#", new_title).strip()
+        old_alpha = re.sub(r"\d+", "#", existing_norm).strip()
+        if new_alpha and new_alpha == old_alpha:
+            new_nums = re.findall(r"\d+", new_title)
+            old_nums = re.findall(r"\d+", existing_norm)
+            if new_nums != old_nums:
+                continue
+
         existing_segs = _url_path_segments(existing_url)
-        if new_segs and existing_segs and not (new_segs & existing_segs):
-            continue
+        overlap = bool(new_segs and existing_segs and (new_segs & existing_segs))
+        # token_sort_ratio penalizes missing/distinctive words; token_set_ratio can
+        # return 100 for a title that is merely a subset of another notice title.
         score = fuzz.token_sort_ratio(new_title, existing_norm)
-        if score >= FUZZY_DUPLICATE_THRESHOLD and score > best_score:
+        threshold = FUZZY_DUPLICATE_THRESHOLD if overlap else FUZZY_CROSS_PATH_THRESHOLD
+        if not overlap and min(len(new_title), len(existing_norm)) < 30:
+            continue
+        if score >= threshold and score > best_score:
             best_score = score
             best = iid
     return best
@@ -1076,37 +1560,62 @@ def discover_from_sitemap(session, base_url, scan):
 
 
 def discover_site(session, site, scan):
+    """⭐ UPDATED: Archive pages fetched (with budget), pagination capped."""
     base_url = site["url"]
     timeout = scan["request_timeout_seconds"]
     max_pages = scan["max_discovery_pages_per_site"]
+    max_archive_pages = scan.get("max_archive_pages_per_site", 5)
+    max_pagination_per_archive = scan.get("max_pagination_per_archive", 3)
+
     discovery_keywords = list(dict.fromkeys(
         scan["discovery_keywords"] + site.get("discovery_keywords", []) + scan["keywords"]
     ))
+
     queue = [base_url]
     queue.extend(discover_from_sitemap(session, base_url, scan))
     visited = set()
+    archive_visited_count = 0
+    pagination_tracker = {}
     candidates = {}
     errors = []
     successful_pages = 0
-    while queue and len(visited) < max_pages:
+    total_budget = max_pages + max_archive_pages
+    normal_visited_count = 0
+
+    while queue and len(visited) < total_budget:
         page = canonical_url(queue.pop(0))
         if page in visited or not same_host(base_url, page):
             continue
+
+        is_archive = _is_archive_url(page)
+        # Reject over-budget URLs before adding them to visited; otherwise a long
+        # queue of skipped archive links can consume the total crawl budget.
+        if is_archive and archive_visited_count >= max_archive_pages:
+            continue
+        if not is_archive and normal_visited_count >= max_pages:
+            continue
         visited.add(page)
 
-        if _is_navigation_url(page):
-            continue
+        if is_archive:
+            is_pagination = bool(re.search(r"/page/\d+|[?&](?:page|paged)=\d+", page, re.I))
+            if is_pagination:
+                prefix = re.sub(r"/page/\d+/?", "/", page)
+                prefix = re.sub(r"[?&]page=\d+", "", prefix)
+                prefix = re.sub(r"[?&]paged=\d+", "", prefix).rstrip("?&")
+                current = pagination_tracker.get(prefix, 0)
+                if current >= max_pagination_per_archive:
+                    continue
+                pagination_tracker[prefix] = current + 1
+
+            archive_visited_count += 1
+        else:
+            normal_visited_count += 1
 
         try:
             response = session.get(page, timeout=timeout, allow_redirects=True)
             if response.status_code >= 400:
                 raise RuntimeError(f"HTTP {response.status_code}")
             final_url = canonical_url(response.url)
-
-            if _is_navigation_url(final_url):
-                successful_pages += 1
-                continue
-
             content_type = response.headers.get("content-type", "").lower()
 
             if _looks_like_pdf_response(response.content, content_type, final_url):
@@ -1124,40 +1633,54 @@ def discover_site(session, site, scan):
             if _is_empty_page_text(response.text):
                 successful_pages += 1
                 continue
+
             found = extract_candidates(response.text, final_url, site, scan)
             for row in found:
                 old = candidates.get(row["url"])
                 if old is None or row["score"] > old["score"]:
                     candidates[row["url"]] = row
             successful_pages += 1
+
             soup = BeautifulSoup(response.text, "html.parser")
             for a in soup.find_all("a", href=True):
                 href = canonical_url(urljoin(final_url, a.get("href", "")))
                 if (not is_http_url(href) or not same_host(base_url, href)
                     or href in visited or href in queue):
                     continue
-                if _is_navigation_url(href):
+
+                if re.search(r"/(login|logout|register|search|tag)/", href, re.I):
                     continue
+
+                if _is_archive_url(href):
+                    if len(queue) < total_budget * 3:
+                        queue.append(href)
+                    continue
+
                 anchor = clean_text(a.get_text(" ", strip=True), 220).lower()
                 path = urlparse(href).path.lower()
                 haystack = f"{anchor} {path}"
                 if any(kw in haystack for kw in discovery_keywords if kw):
                     queue.append(href)
-                    if len(queue) >= max_pages * 2:
+                    if len(queue) >= total_budget * 2:
                         break
         except Exception as exc:
             errors.append(f"{page}: {clean_text(str(exc), 250)}")
+
     values = list(candidates.values())
     values.sort(key=lambda x: (-x["score"], x["title"].lower()))
     return (site["id"], values[: scan["max_items_per_site"]], errors, successful_pages > 0)
 
 
 def scan_site(site, scan):
-    return discover_site(make_session(), site, scan)
+    session = make_session()
+    try:
+        return discover_site(session, site, scan)
+    finally:
+        session.close()
 
 
 # ---------------------------------------------------------------------------
-# PDF extraction — plumber → Gemini → RapidOCR
+# PDF extraction
 # ---------------------------------------------------------------------------
 
 def _extract_pdf_text_plumber(content):
@@ -1186,150 +1709,91 @@ def _extract_pdf_text_plumber(content):
 
 
 def _extract_pdf_text_rapidocr(content):
-    """⭐ RapidOCR — Tesseract replacement. Fast, accurate, free, lightweight."""
     if not OCR_ENABLED or not _RAPIDOCR_AVAILABLE:
         return ""
-
     ocr = _get_rapidocr()
     if ocr is None:
         return ""
-
     parts = []
     try:
         doc = fitz.open(stream=content, filetype="pdf")
         pages_to_process = min(len(doc), MAX_PDF_PAGES, _OCR_MAX_PAGES)
-
         for page_num in range(pages_to_process):
             try:
                 page = doc.load_page(page_num)
                 pix = page.get_pixmap(dpi=OCR_DPI)
                 img_bytes = pix.tobytes("png")
-
                 result, _ = ocr(img_bytes)
                 if result:
-                    # result format: [[box, text, confidence], ...]
                     page_lines = [line[1] for line in result if len(line) > 1]
                     if page_lines:
                         parts.append("\n".join(page_lines))
             except Exception as exc:
                 print(f"[WARN] RapidOCR page {page_num+1} failed: {exc}", file=sys.stderr)
-
         doc.close()
     except Exception as exc:
         print(f"[WARN] RapidOCR PDF processing failed: {exc}", file=sys.stderr)
-
     return "\n".join(parts)
 
 
 def _extract_with_gemini_pdf(pdf_bytes):
-    """Gemini PDF OCR with dynamic models + quota tracking."""
     global _GEMINI_QUOTA_EXHAUSTED
-
     if not GEMINI_PDF_OCR_ENABLED or not _GEMINI_API_KEY:
         return ""
-
-    # Quota exhausted → skip Gemini entirely (RapidOCR will handle)
     if _GEMINI_QUOTA_EXHAUSTED:
         return ""
-
     if len(pdf_bytes) > MAX_GEMINI_PDF_BYTES:
-        print(
-            f"[INFO] PDF too large for Gemini ({len(pdf_bytes)} bytes > "
-            f"{MAX_GEMINI_PDF_BYTES}), skipping Gemini",
-            file=sys.stderr,
-        )
+        print(f"[INFO] PDF too large for Gemini ({len(pdf_bytes)} bytes), skipping", file=sys.stderr)
         return ""
-
     try:
         pdf_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
-
         prompt = (
             "Extract ALL text from this government notice PDF. "
             "May be in Hindi, English, or both. May contain tables. "
             "Return extracted text verbatim, preserving structure. "
             "Do NOT summarize. Do NOT invent. Just extract the text."
         )
-
         payload = {
-            "contents": [{
-                "parts": [
-                    {"text": prompt},
-                    {"inline_data": {
-                        "mime_type": "application/pdf",
-                        "data": pdf_b64,
-                    }}
-                ]
-            }],
-            "generationConfig": {
-                "temperature": 0.0,
-                "maxOutputTokens": 16384,
-            },
+            "contents": [{"parts": [
+                {"text": prompt},
+                {"inline_data": {"mime_type": "application/pdf", "data": pdf_b64}}
+            ]}],
+            "generationConfig": {"temperature": 0.0, "maxOutputTokens": 16384},
         }
-
-        headers = {
-            "x-goog-api-key": _GEMINI_API_KEY,
-            "Content-Type": "application/json",
-        }
-
+        headers = {"x-goog-api-key": _GEMINI_API_KEY, "Content-Type": "application/json"}
         for model in _DYNAMIC_MODELS:
             if model in _DEAD_MODELS:
                 continue
-
-            endpoint = (
-                "https://generativelanguage.googleapis.com/"
-                f"v1beta/models/{model}:generateContent"
-            )
-
+            endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
             for attempt in range(2):
                 try:
-                    response = requests.post(
-                        endpoint, headers=headers,
-                        json=payload,
-                        timeout=90,
-                    )
-
+                    response = requests.post(endpoint, headers=headers, json=payload, timeout=90)
                     if response.status_code == 429:
                         try:
                             err_data = response.json()
                             err_msg = str(err_data.get("error", {}).get("message", ""))
                         except Exception:
                             err_msg = response.text
-
                         if "quota" in err_msg.lower() or "exceeded" in err_msg.lower():
                             _GEMINI_QUOTA_EXHAUSTED = True
-                            print(
-                                f"[QUOTA] Gemini quota exhausted — "
-                                f"switching to RapidOCR for rest of run",
-                                file=sys.stderr,
-                            )
+                            print("[QUOTA] Gemini quota exhausted — switching to RapidOCR", file=sys.stderr)
                             return ""
                         else:
                             print(f"[WARN] Gemini 429 short-limit ({model})", file=sys.stderr)
                             time.sleep(10)
                             continue
-
                     if response.status_code == 404:
                         _DEAD_MODELS.add(model)
                         print(f"[WARN] Gemini model DEAD ({model})", file=sys.stderr)
                         break
-
                     if response.status_code >= 400:
-                        print(
-                            f"[WARN] Gemini {response.status_code} ({model}): "
-                            f"{response.text[:150]}",
-                            file=sys.stderr,
-                        )
+                        print(f"[WARN] Gemini {response.status_code} ({model}): {response.text[:150]}", file=sys.stderr)
                         break
-
                     data = response.json()
                     text = _extract_gemini_text(data)
                     if text and len(text.strip()) > 50:
-                        print(
-                            f"[INFO] Gemini PDF OCR succeeded ({model}, attempt {attempt+1})",
-                            file=sys.stderr,
-                        )
+                        print(f"[INFO] Gemini PDF OCR succeeded ({model}, attempt {attempt+1})", file=sys.stderr)
                         return text
-
                     finish_reason = "unknown"
                     try:
                         cands = data.get("candidates") or []
@@ -1337,22 +1801,16 @@ def _extract_with_gemini_pdf(pdf_bytes):
                             finish_reason = cands[0].get("finishReason", "unknown")
                     except Exception:
                         pass
-                    print(
-                        f"[WARN] Gemini empty ({model}), finishReason={finish_reason}",
-                        file=sys.stderr,
-                    )
+                    print(f"[WARN] Gemini empty ({model}), finishReason={finish_reason}", file=sys.stderr)
                     break
-
                 except requests.Timeout:
                     print(f"[WARN] Gemini timeout ({model}), attempt {attempt+1}/2", file=sys.stderr)
                     continue
                 except Exception as exc:
                     print(f"[WARN] Gemini error ({model}): {exc}", file=sys.stderr)
                     break
-
     except Exception as exc:
         print(f"[WARN] Gemini PDF OCR failed: {exc}", file=sys.stderr)
-
     return ""
 
 
@@ -1360,48 +1818,41 @@ def _text_looks_thin(text):
     stripped = (text or "").strip()
     if len(stripped) < OCR_MIN_TEXT_CHARS:
         return True
-
     words = re.findall(r"\w+", stripped, re.UNICODE)
     if len(words) < 20:
         return True
-
     if not re.search(r"\d", stripped):
         return True
-
     if stripped.count("\n") < 3:
         return True
-
     char_counts = Counter(stripped.lower())
     if char_counts:
         most_common_count = char_counts.most_common(1)[0][1]
         if most_common_count > len(stripped) * 0.5:
             return True
-
     return False
 
 
 def download_pdf_content(pdf_url, timeout=30):
     global _RUNTIME_PDF_CACHE
-
     if pdf_url in _RUNTIME_PDF_CACHE:
         content = _RUNTIME_PDF_CACHE[pdf_url]
     else:
+        session = make_session()
         try:
-            session = make_session()
             content, actual_url, method = _download_with_pdf_resolution(session, pdf_url, timeout)
-
             if not content:
                 return None, "", False, method
-
             if len(content) > MAX_PDF_SEND_BYTES:
                 return None, "", False, "size_limit"
-
             _cache_put(pdf_url, content)
             if actual_url and actual_url != pdf_url:
                 _cache_put(actual_url, content)
         except Exception as exc:
             print(f"[WARN] PDF download failed for {pdf_url}: {exc}", file=sys.stderr)
             return None, "", False, "download_error"
+        finally:
+            session.close()
 
     text = _extract_pdf_text_plumber(content)
     extraction_method = "plumber"
@@ -1409,12 +1860,8 @@ def download_pdf_content(pdf_url, timeout=30):
     if _text_looks_thin(text):
         print(f"[INFO] PDF thin ({len(text)} chars). Trying Gemini PDF OCR...", file=sys.stderr)
         gemini_text = _extract_with_gemini_pdf(content)
-
         if gemini_text and len(gemini_text.strip()) > len(text.strip()):
-            text = (
-                f"{text}\n\n--- GEMINI OCR ---\n\n{gemini_text}"
-                if text.strip() else gemini_text
-            )
+            text = f"{text}\n\n--- GEMINI OCR ---\n\n{gemini_text}" if text.strip() else gemini_text
             extraction_method = "gemini"
             print(f"[INFO] Gemini OCR succeeded ({len(gemini_text)} chars)", file=sys.stderr)
         else:
@@ -1422,10 +1869,7 @@ def download_pdf_content(pdf_url, timeout=30):
                 print("[INFO] Gemini failed/skipped. Trying RapidOCR...", file=sys.stderr)
                 rocr_text = _extract_pdf_text_rapidocr(content)
                 if rocr_text and len(rocr_text.strip()) > len(text.strip()):
-                    text = (
-                        f"{text}\n\n--- RAPIDOCR ---\n\n{rocr_text}"
-                        if text.strip() else rocr_text
-                    )
+                    text = f"{text}\n\n--- RAPIDOCR ---\n\n{rocr_text}" if text.strip() else rocr_text
                     extraction_method = "rapidocr"
                     print(f"[INFO] RapidOCR succeeded ({len(rocr_text)} chars)", file=sys.stderr)
                 else:
@@ -1433,12 +1877,7 @@ def download_pdf_content(pdf_url, timeout=30):
             else:
                 print("[INFO] RapidOCR disabled or unavailable", file=sys.stderr)
 
-    return (
-        content,
-        clean_text(text, MAX_PDF_TEXT_CHARS),
-        extraction_method != "plumber",
-        extraction_method,
-    )
+    return (content, clean_text(text, MAX_PDF_TEXT_CHARS), extraction_method != "plumber", extraction_method)
 
 
 # ---------------------------------------------------------------------------
@@ -1489,7 +1928,6 @@ def _build_prompt(prompt_items):
         "You classify and extract details from links on official "
         "Jharkhand district websites (nic.in). "
         "Return JSON only using the exact schema below.\n\n"
-
         "CRITICAL — set important=false for ALL of these:\n"
         "- Language selector links (titles like 'हिन्दी', 'English')\n"
         "- Category listing pages, archive pages, pagination pages\n"
@@ -1499,9 +1937,7 @@ def _build_prompt(prompt_items):
         "- Generic descriptions like 'listing page', 'category page'\n"
         "- Birth and death figures, COVID-19 updates, cause lists, "
         "tour programs, holiday lists, generic events\n\n"
-
         "Set important=true ONLY for genuine, specific notices.\n\n"
-
         "For EACH item determine:\n"
         "1. important (true/false)\n"
         "2. category — one of: 'vacancy', 'result', 'admit_card', 'answer_key', "
@@ -1509,24 +1945,13 @@ def _build_prompt(prompt_items):
         "'tender', 'gazette', 'land_revenue', 'press_release', "
         "'announcement', 'publication', 'notice', 'other'\n"
         "3. summary — 1-line summary (<= 150 chars)\n"
-        "4. title_hi — Hindi (Devanagari) translation of the title. "
-        "If the title is already in Hindi, set title_hi to the same title. "
-        "If the title is in English, translate to Hindi. "
-        "Do NOT translate proper names/abbreviations/numbers. "
-        "Keep it short (<= 200 chars).\n\n"
-
-        "IMPORTANT: If 'pdf_text' is provided, treat it as PRIMARY source. "
-        "The text may come from OCR (scanned PDF) and could have minor errors. "
-        "Extract only what you are confident about. "
-        "If a value is unclear, set it to null instead of guessing.\n\n"
-
+        "4. title_hi — Hindi (Devanagari) translation of the title.\n\n"
+        "IMPORTANT: If 'pdf_text' is provided, treat it as PRIMARY source.\n\n"
         "── UNIVERSAL FIELDS ──\n"
         "reference_number, issuing_authority, issuing_date, "
         "contact_person, contact_number, email, helpline_number, "
         "official_address, important_instructions\n\n"
-
         "── CATEGORY-SPECIFIC EXTRACTION ──\n\n"
-
         "VACANCY: total_posts (int), post_details (array of "
         "{post_name, category (UR/OBC/SC/ST/EWS), vacancies}), "
         "qualification, age_limit, age_relaxation, pay_scale, salary_type, "
@@ -1535,80 +1960,63 @@ def _build_prompt(prompt_items):
         "selection_process, experience_required, posting_location, "
         "reservation_details, bond_details, interview_date, "
         "interview_time, venue, reporting_time, engagement_type\n\n"
-
         "RESULT: result_for, exam_name, session, semester, result_date, "
         "result_link, result_type, merit_list_link, cutoff_marks, "
         "total_selected, next_stage, next_stage_date, roll_no_required, "
         "rechecking_last_date, rechecking_link, rechecking_fee, rechecking_mode\n\n"
-
         "ADMIT_CARD: exam_name, session, semester, exam_date, exam_time, "
         "exam_duration, exam_pattern, exam_center, reporting_time, "
         "download_start_date, download_last_date, roll_no_required, "
         "admit_card_link, instructions, helpline_number, download_mode\n\n"
-
         "ANSWER_KEY: exam_name, session, exam_date, total_questions, "
         "answer_key_link, objection_start_date, objection_last_date, "
         "objection_fee, per_question_fee, objection_mode, objection_address, "
         "payment_mode, answer_key_type\n\n"
-
         "ADMISSION: course_name, course_duration, session, university_name, "
         "eligibility, eligibility_marks, age_criteria, application_fee, "
         "fee_structure, apply_start_date, last_date, counselling_date, "
         "apply_link, admission_mode, total_seats, entrance_exam_name, "
         "hostel_available, documents_required, prospectus_link\n\n"
-
         "COUNSELLING: course_name, round, counselling_date, counselling_time, "
         "venue, apply_link, seat_matrix, registration_fee, "
         "choice_filling_dates, required_documents, reporting_time, "
         "counselling_mode, next_round_date\n\n"
-
         "SCHOLARSHIP: scheme_name, scholarship_amount, scholarship_duration, "
         "eligibility, applicable_category, income_limit, last_date, "
         "apply_link, apply_mode, portal_name, disbursement_mode, "
         "renewal_criteria, documents_required, income_certificate_required, "
         "caste_certificate_required, selection_criteria, helpline\n\n"
-
         "EXAM_SCHEDULE: exam_name, session, semester, course, "
         "exam_start_date, exam_end_date, exam_time, exam_center, "
         "timetable_link, subject_list, paper_code, practical_dates, "
         "viva_dates, reporting_time, instructions\n\n"
-
         "TENDER: tender_no, tender_type, work_description, issuing_authority, "
         "estimated_cost, emd_amount, emd_mode, tender_fee, tender_fee_mode, "
         "submission_last_date, opening_date, pre_bid_meeting_date, "
         "pre_bid_meeting_venue, submission_mode, apply_link, "
         "tender_document_link, bid_validity, completion_period, "
         "payment_terms, eligibility_criteria\n\n"
-
         "GAZETTE: gazette_no, gazette_type, subject, issuing_authority, "
         "publication_date, gazette_link, effective_date, gazette_content\n\n"
-
         "LAND_REVENUE: notification_no, subject, land_location, affected_area, "
         "plot_numbers, khasra_no, thana_no, district, tehsil, village, "
         "notification_type, issuing_authority, effective_date, order_link, "
         "compensation_details, objections_last_date, objections_address, land_type\n\n"
-
         "PRESS_RELEASE: subject, issuing_department, release_date, "
         "reference_no, release_link, full_content, category\n\n"
-
         "ANNOUNCEMENT: subject, issuing_authority, reference_no, "
         "effective_date, apply_link, announcement_type, target_audience, "
         "action_required, action_deadline\n\n"
-
         "PUBLICATION: publication_name, publication_type, publisher, "
         "publication_date, download_link, author, pages, language, "
         "edition, isbn, price\n\n"
-
         "NOTICE: subject, reference_no, issuing_authority, effective_date, "
         "order_link, notice_type, applicable_to, action_required, "
         "action_deadline, supersedes\n\n"
-
         "── EXTRA DETAILS ──\n"
         "Extract ALL other fields into 'extra_details' as array of "
         "{\"label\": \"...\", \"value\": \"...\"}. Limit 10 per item.\n\n"
-
         "Do NOT invent facts. Use null when unsure.\n\n"
-
         "Schema:\n"
         '{"items":[{'
         '"id":"0","important":true,"category":"vacancy","summary":"...","title_hi":"...",'
@@ -2021,13 +2429,10 @@ def gemini_classify(items, api_key, model, timeout):
 
 
 def gemini_classify_with_fallback(items, api_key, timeout):
-    """Dynamic model fallback — uses discovered models, skips dead ones."""
     global _GEMINI_QUOTA_EXHAUSTED
-
     if _GEMINI_QUOTA_EXHAUSTED:
         print("[QUOTA] Gemini quota exhausted — using keyword fallback", file=sys.stderr)
         return keyword_fallback(items)
-
     seen = []
     for model in _DYNAMIC_MODELS:
         if model in seen or model in _DEAD_MODELS:
@@ -2108,9 +2513,7 @@ def send_telegram_document(token, chat_id, pdf_bytes, filename, caption=""):
             }
             response = requests.post(
                 f"https://api.telegram.org/bot{token}/sendDocument",
-                data=data,
-                files=files,
-                timeout=60,
+                data=data, files=files, timeout=60,
             )
             if response.ok:
                 return (True, False, "sent")
@@ -2161,7 +2564,6 @@ def _safe_filename(url, default="notice.pdf"):
 def _build_pdf_caption(full_message, classification):
     if not classification:
         return full_message[:TELEGRAM_CAPTION_LIMIT]
-
     priority_keys = [
         ("last_date", "Last Date"),
         ("submission_last_date", "Submission Last"),
@@ -2173,19 +2575,15 @@ def _build_pdf_caption(full_message, classification):
         ("application_fee", "Fee"),
         ("pay_scale", "Pay"),
     ]
-
     parts = []
     for k, label in priority_keys:
         v = classification.get(k)
         if v:
             parts.append(f"• {label}: {v}")
-
     priority_block = ""
     if parts:
         priority_block = "\n\n━━━\n" + "\n".join(parts[:6])
-
     available = TELEGRAM_CAPTION_LIMIT - len(priority_block)
-
     if available > 200:
         caption = full_message[:available]
         last_nl = caption.rfind("\n")
@@ -2198,15 +2596,11 @@ def _build_pdf_caption(full_message, classification):
 def send_notification_with_pdf(token, chat_id, record, full_message):
     pdf_url = record.get("url", "")
     filename = _safe_filename(pdf_url)
-
     pdf_bytes = _RUNTIME_PDF_CACHE.get(pdf_url)
-
     if pdf_bytes is None:
+        session = make_session()
         try:
-            session = make_session()
-            content, actual_url, method = _download_with_pdf_resolution(
-                session, pdf_url, 30
-            )
+            content, actual_url, method = _download_with_pdf_resolution(session, pdf_url, 30)
             if content and len(content) <= MAX_PDF_SEND_BYTES:
                 pdf_bytes = content
                 _cache_put(pdf_url, content)
@@ -2217,10 +2611,10 @@ def send_notification_with_pdf(token, chat_id, record, full_message):
                         filename = new_name
         except Exception as exc:
             print(f"[WARN] PDF download for send failed: {exc}", file=sys.stderr)
-
+        finally:
+            session.close()
     if not pdf_bytes:
         return send_telegram(token, chat_id, truncate_telegram(full_message))
-
     caption = _build_pdf_caption(full_message, record.get("classification"))
     if len(caption) > TELEGRAM_CAPTION_LIMIT:
         caption = caption[:TELEGRAM_CAPTION_LIMIT]
@@ -2228,7 +2622,6 @@ def send_notification_with_pdf(token, chat_id, record, full_message):
         if last_nl > TELEGRAM_CAPTION_LIMIT * 0.7:
             caption = caption[:last_nl]
         caption = caption.rstrip()
-
     return send_telegram_document(token, chat_id, pdf_bytes, filename, caption=caption)
 
 
@@ -2849,16 +3242,13 @@ def format_message(site, item, classification=None):
             or _title_from_url(item.get("url", ""))
             or "Notification"
         )
-
     title_hi = _safe_str(classification.get("title_hi"), 200)
     title_is_hindi = _is_devanagari(raw_title)
-
     site_name = html.escape(site["name"])
     url = html.escape(item["url"], quote=True)
     summary = html.escape(_safe_str(classification.get("summary")) or "")
     category = (classification.get("category") or "notice").lower()
     emoji = CATEGORY_EMOJI.get(category, "📌")
-
     ocr_method = item.get("pdf_method", "")
     if ocr_method == "gemini":
         ocr_marker = " 🔍G"
@@ -2866,28 +3256,22 @@ def format_message(site, item, classification=None):
         ocr_marker = " 🔍R"
     else:
         ocr_marker = ""
-
     pdf_marker = " 📄" if item.get("is_pdf") else ""
-
     lines = [f"🔔 <b>{site_name}</b>{pdf_marker}", ""]
-
     lines.append(f"<b>{html.escape(raw_title)}</b>{ocr_marker}")
     if not title_is_hindi and title_hi and title_hi.strip().lower() != raw_title.strip().lower():
         if NOTIFY_LANGUAGE in ("both", "hi"):
             lines.append(f"<i>{html.escape(title_hi)}</i>")
-
     lines.append("")
     if summary:
         lines.append(summary)
         lines.append("")
-
     try:
         formatter = _FORMATTERS.get(category)
         if formatter:
             formatter(lines, classification)
     except Exception as exc:
         print(f"[WARN] Message formatting error: {exc}", file=sys.stderr)
-
     lines.append("")
     lines.append(f"{emoji} <b>{html.escape(_category_name(category))}</b>")
     lines.append(f'🔗 <a href="{url}">{html.escape(_labels("read_full"))}</a>')
@@ -2909,22 +3293,209 @@ def truncate_telegram(text, limit=TELEGRAM_SAFE_LIMIT):
 # Prune / stats
 # ---------------------------------------------------------------------------
 
-def prune_state(state, retention_days):
-    cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+def prune_state(state, retention_days, max_items=3000, max_pending_attempts=72, max_bytes=3000000):
+    """Keep state bounded and useful for deduplication without retaining full AI/PDF payloads."""
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=retention_days)
+    items = state.setdefault("items", {})
     remove = []
-    for key, record in state.get("items", {}).items():
+    terminal = {"sent", "ignored", "permanent_error", "baseline"}
+
+    for key, record in list(items.items()):
         if not isinstance(record, dict):
             remove.append(key)
             continue
-        stamp = record.get("last_seen") or record.get("first_seen")
-        try:
-            dt = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
-        except Exception:
-            dt = datetime.now(timezone.utc)
-        if dt < cutoff and record.get("status") in {"sent", "ignored", "permanent_error", "baseline"}:
-            remove.append(key)
+
+        status = record.get("status", "baseline")
+        loaded_status = record.pop("_loaded_status", None)
+        # Avoid records that remain pending forever after their retry budget is exhausted.
+        if status == "pending" and int(record.get("attempts", 0) or 0) >= max_pending_attempts:
+            record["status"] = "permanent_error"
+            record["last_error"] = clean_text(
+                "Retry limit reached; last error: " + str(record.get("last_error") or "unknown"), 500
+            )
+            status = "permanent_error"
+        telegram_attempts = int(record.get("telegram_attempts", 0) or 0)
+        telegram_first_failed = _parse_utc_timestamp(record.get("telegram_first_failed_at"))
+        telegram_window_expired = bool(
+            telegram_first_failed
+            and (now - telegram_first_failed).total_seconds() > TELEGRAM_RETRY_WINDOW_HOURS * 3600
+        )
+        if status == "ready" and (
+            telegram_attempts >= TELEGRAM_MAX_ATTEMPTS or telegram_window_expired
+        ):
+            print(
+                f"[ERROR] Telegram retry exhausted for {record.get('url', key)[:100]} "
+                f"after {telegram_attempts} attempt(s); manual review required.",
+                file=sys.stderr,
+            )
+            record["status"] = "permanent_error"
+            record["last_error"] = clean_text(
+                "Telegram retry window/attempt limit reached; last error: "
+                + str(record.get("last_error") or "unknown"), 500
+            )
+            status = "permanent_error"
+
+        if status in terminal:
+            # Existing state migration: use first_seen once, not last_seen (which refreshes
+            # every crawl and otherwise makes old records immortal).
+            if not record.get("terminal_at"):
+                if loaded_status and loaded_status not in terminal:
+                    record["terminal_at"] = now.isoformat()
+                else:
+                    record["terminal_at"] = record.get("first_seen") or record.get("last_seen") or now.isoformat()
+            # Terminal records need only small metadata for deduplication and PDF change checks.
+            record.pop("pdf_text", None)
+            record.pop("classification", None)
+            record.pop("summary", None)
+            record.pop("pdf_extracted", None)
+            record.pop("pdf_method", None)
+            record.pop("ocr_used", None)
+            if record.get("context"):
+                record["context"] = clean_text(record.get("context"), 300)
+            stamp = record.get("terminal_at")
+            try:
+                dt = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                dt = now
+            if dt < cutoff:
+                remove.append(key)
+        else:
+            # A re-opened/changed item is active again; don't carry a terminal timestamp.
+            record.pop("terminal_at", None)
+
     for key in remove:
-        state["items"].pop(key, None)
+        items.pop(key, None)
+
+    # Hard item-count ceiling is a backstop in addition to age-based retention.
+    if len(items) > max_items:
+        terminal_rows = []
+        active_rows = []
+        for key, record in items.items():
+            stamp = record.get("terminal_at") or record.get("last_seen") or record.get("first_seen") or ""
+            row = (str(stamp), key)
+            if record.get("status") in terminal:
+                terminal_rows.append(row)
+            else:
+                active_rows.append(row)
+        terminal_rows.sort()
+        while len(items) > max_items and terminal_rows:
+            _, key = terminal_rows.pop(0)
+            items.pop(key, None)
+        # Exceptional overload only: keep newest active records, but report any active
+        # records that must be evicted so the state file remains bounded.
+        if len(items) > max_items:
+            active_rows.sort(reverse=True)
+            keep = {key for _, key in active_rows[:max_items - len(items) + len(active_rows)]}
+            for _, key in active_rows:
+                if len(items) <= max_items:
+                    break
+                if key in items and key not in keep:
+                    items.pop(key, None)
+            if len(items) > max_items:
+                for _, key in sorted(active_rows):
+                    if len(items) <= max_items:
+                        break
+                    items.pop(key, None)
+            print("[WARN] State hard cap reached; oldest excess records were evicted.", file=sys.stderr)
+
+    # Bound serialized bytes as well as item count. This is important because a
+    # few unusually large active classifications can otherwise make Git state grow.
+    def serialized_size():
+        try:
+            payload = json.dumps(state, ensure_ascii=False, indent=2, separators=(",", ": ")) + "\n"
+            return len(payload.encode("utf-8"))
+        except (TypeError, ValueError):
+            return max_bytes + 1
+
+    # First compact fields that are not needed to resume work or format a Telegram message.
+    for record in items.values():
+        if not isinstance(record, dict):
+            continue
+        for field, limit in (("title", 300), ("context", 700), ("summary", 500), ("last_error", 500), ("pdf_text", MAX_PDF_TEXT_CHARS)):
+            value = record.get(field)
+            if isinstance(value, str) and len(value) > limit:
+                record[field] = clean_text(value, limit)
+        classification = record.get("classification")
+        if isinstance(classification, dict):
+            compact = {}
+            for key, value in classification.items():
+                if value is None or value == "" or value == []:
+                    continue
+                if key == "post_details" and isinstance(value, list):
+                    compact[key] = value[:8]
+                elif key == "extra_details" and isinstance(value, list):
+                    compact[key] = value[:8]
+                elif isinstance(value, str):
+                    compact[key] = clean_text(value, 500)
+                else:
+                    compact[key] = value
+            compact.setdefault("important", bool(classification.get("important", False)))
+            compact.setdefault("category", classification.get("category", "notice"))
+            record["classification"] = compact
+
+    # Drop the oldest terminal/dedup-only records until the byte budget is met.
+    if serialized_size() > max_bytes:
+        terminal_rows = []
+        for key, record in items.items():
+            if isinstance(record, dict) and record.get("status") in terminal:
+                stamp = record.get("terminal_at") or record.get("first_seen") or record.get("last_seen") or ""
+                terminal_rows.append((str(stamp), key))
+        terminal_rows.sort()
+        removed_terminal = 0
+        for _, key in terminal_rows:
+            items.pop(key, None)
+            removed_terminal += 1
+            # Re-serialize in batches; checking after every deletion is quadratic
+            # and can slow down a large recovery/backlog run.
+            if removed_terminal % 20 == 0 and serialized_size() <= max_bytes:
+                break
+
+    # Last-resort compaction preserves unsent ready notices first. Pending records
+    # keep enough extracted text for a retry, while already-classified ready records
+    # no longer need the full PDF text persisted.
+    if serialized_size() > max_bytes:
+        for record in items.values():
+            if not isinstance(record, dict):
+                continue
+            status = record.get("status")
+            if status == "ready" and record.get("classification"):
+                record.pop("pdf_text", None)
+            elif status == "pending" and isinstance(record.get("pdf_text"), str):
+                record["pdf_text"] = clean_text(record["pdf_text"], 1800)
+            if isinstance(record.get("context"), str):
+                record["context"] = clean_text(record["context"], 350)
+        if serialized_size() > max_bytes:
+            # Rare overload: preserve newest ready/pending records; evict oldest
+            # records only when retaining all of them would violate the hard cap.
+            active = []
+            for key, record in items.items():
+                if not isinstance(record, dict):
+                    active.append(("", 2, key))
+                    continue
+                status = record.get("status", "baseline")
+                priority = 2 if status == "ready" else 1 if status == "pending" else 0
+                stamp = str(record.get("first_seen") or record.get("last_seen") or "")
+                active.append((priority, stamp, key))
+            # Evict low-priority records first, then oldest within each priority.
+            active.sort(key=lambda row: (row[0], row[1]))
+            evicted = 0
+            for _, _, key in active:
+                items.pop(key, None)
+                evicted += 1
+                if evicted % 20 == 0 and serialized_size() <= max_bytes:
+                    break
+            if evicted:
+                print(f"[WARN] State byte cap reached; evicted {evicted} oldest active record(s).", file=sys.stderr)
+
+    final_size = serialized_size()
+    if final_size > max_bytes:
+        # Do not write an oversized state silently. The caller logs the measured size;
+        # this should only occur if the state envelope itself is larger than the cap.
+        raise RuntimeError(f"State exceeds configured byte cap: {final_size} > {max_bytes}")
+    print(f"[STATE] bounded state size={final_size} bytes (limit={max_bytes})")
 
 
 def refresh_stats(state):
@@ -2947,10 +3518,8 @@ def _should_fetch_pdf(record):
         return False
     if int(record.get("pdf_attempts", 0)) >= MAX_PDF_ATTEMPTS:
         return False
-
     url = record.get("url", "")
     url_lower = url.lower()
-
     if any(pat in url_lower for pat in (
         "/past-notices", "/past_notices",
         "/whats-new", "/whats_new",
@@ -2959,14 +3528,12 @@ def _should_fetch_pdf(record):
         "/archive", "/search",
     )):
         return False
-
     try:
         parsed = urlparse(url)
         if parsed.path in ("", "/"):
             return False
     except Exception:
         pass
-
     return True
 
 
@@ -2998,10 +3565,36 @@ def _fetch_pdfs_for_batch(batch, scan):
                 content, text, ocr_used, method = None, "", False, "error"
             record["pdf_attempts"] = int(record.get("pdf_attempts", 0)) + 1
             record["pdf_method"] = method
+            if content:
+                try:
+                    new_hash = _pdf_content_fingerprint(content)
+                    new_kind = new_hash.split(":", 1)[0]
+                    old_hash = record.get("pdf_hash")
+                    old_kind = record.get("pdf_hash_kind")
+                    if old_hash and old_kind == new_kind and old_hash != new_hash:
+                        print(f"[PDF-CHANGED] PDF rendered content changed: {record.get('url', '')[:100]}", file=sys.stderr)
+                        record["classification"] = None
+                        record["summary"] = ""
+                    record["pdf_hash"] = new_hash
+                    record["pdf_hash_kind"] = new_kind
+                except Exception as exc:
+                    print(f"[WARN] PDF hash failed: {exc}", file=sys.stderr)
             if text:
                 record["pdf_text"] = text[:MAX_PDF_TEXT_CHARS]
                 record["pdf_extracted"] = True
                 record["ocr_used"] = bool(ocr_used)
+                pdf_dates = _extract_explicit_issue_dates(text)
+                if pdf_dates:
+                    now = datetime.now(timezone.utc)
+                    past = [d for d in pdf_dates if d <= now]
+                    if past:
+                        latest_pdf_date = max(past)
+                        cutoff = now - timedelta(days=STALE_NOTICE_DAYS)
+                        if latest_pdf_date < cutoff:
+                            record["status"] = "baseline"
+                            record["last_error"] = f"PDF content stale ({latest_pdf_date.date()})"
+                            print(f"[STALE-PDF] Explicit issue date {latest_pdf_date.date()} in {record.get('url','')[:80]}", file=sys.stderr)
+                            continue
 
 
 def _parse_upload_date(raw):
@@ -3014,6 +3607,23 @@ def _parse_upload_date(raw):
         return dt
     except Exception:
         return None
+
+
+def enqueue_persisted_pending(state, pending, max_pending_attempts, configured_site_ids):
+    """Requeue persisted pending records even when a current site scan misses them."""
+    by_id = {iid: record for iid, record in pending}
+    for iid, record in state.get("items", {}).items():
+        if not isinstance(record, dict) or record.get("status") != "pending":
+            continue
+        sid = record.get("site_id")
+        if sid not in configured_site_ids:
+            continue
+        if not site_state(state, sid).get("baseline_complete", False):
+            continue
+        if int(record.get("attempts", 0) or 0) >= max_pending_attempts:
+            continue
+        by_id[iid] = record
+    return list(by_id.items())
 
 
 def main():
@@ -3086,6 +3696,19 @@ def main():
                 mark_site_failure(state, site["id"], str(exc))
                 print(f"[ERROR] {site['name']}: {exc}", file=sys.stderr)
 
+    # ⭐ NEW: Site alerts (after all sites done)
+    try:
+        threshold = scan.get("site_alert_threshold", 3)
+        cooldown = scan.get("site_alert_cooldown_hours", 6)
+        empty_threshold = scan.get("site_empty_scan_threshold_runs", 72)
+        _check_and_send_site_alerts(
+            state, cfg, token, chat_id,
+            threshold, cooldown,
+            empty_threshold,
+        )
+    except Exception as exc:
+        print(f"[WARN] Site alert check failed: {exc}", file=sys.stderr)
+
     site_index = build_site_index(state)
     pending = []
 
@@ -3111,6 +3734,7 @@ def main():
                     "pdf_method": "", "telegram_attempts": 0, "pdf_sent": False,
                     "upload_date": candidate.get("upload_date"),
                     "last_error": None,
+                    "etag": None, "last_modified": None, "pdf_hash": None, "pdf_hash_kind": None, "last_content_check_at": None,
                 })
             ss["baseline_complete"] = True
             print(f"[BASELINE] {site['name']} initialized with {len(candidates)} item(s)")
@@ -3131,9 +3755,44 @@ def main():
             )
 
             if record is None:
-                fuzzy_iid = find_fuzzy_match(site_items_list, candidate["title"], candidate["url"])
-                if fuzzy_iid and fuzzy_iid in state["items"]:
-                    state["items"][fuzzy_iid]["last_seen"] = utc_now()
+                # Prefer URL identity over title similarity: official notice pages often
+                # keep the same URL while the title/context changes after an update.
+                matched_iid = find_url_match(site_items_list, candidate["url"])
+                if not matched_iid:
+                    matched_iid = find_fuzzy_match(site_items_list, candidate["title"], candidate["url"])
+                if matched_iid and matched_iid in state["items"]:
+                    iid = matched_iid
+                    record = state["items"][matched_iid]
+                    old_title = clean_text(record.get("title", ""), 300)
+                    old_context = clean_text(record.get("context", ""), 700)
+                    new_title = clean_text(candidate.get("title", ""), 300)
+                    new_context = clean_text(candidate.get("context", ""), 700)
+                    metadata_changed = _meaningful_metadata_change(
+                        old_title, new_title, old_context, new_context
+                    )
+                    record["last_seen"] = utc_now()
+                    if metadata_changed and record.get("status") in {"sent", "ignored", "baseline"}:
+                        record["status"] = "pending"
+                        record.pop("terminal_at", None)
+                        record["attempts"] = 0
+                        record["last_error"] = None
+                        record["classification"] = None
+                        record["summary"] = ""
+                        record["pdf_extracted"] = False
+                        record["pdf_text"] = ""
+                        record["pdf_attempts"] = 0
+                        record["ocr_used"] = False
+                        record["pdf_method"] = ""
+                        print(f"[RE-PROCESS] Existing notice metadata changed: {candidate['url'][:100]}")
+                    if new_title:
+                        record["title"] = new_title
+                    if new_context:
+                        record["context"] = new_context
+                    if candidate.get("upload_date"):
+                        record["upload_date"] = candidate["upload_date"]
+                    record["is_pdf"] = bool(record.get("is_pdf") or is_pdf_or_notice)
+                    if record.get("status") == "pending" and int(record.get("attempts", 0)) < scan["max_pending_attempts"]:
+                        pending.append((iid, record))
                     continue
 
                 upload_dt = _parse_upload_date(candidate.get("upload_date"))
@@ -3153,6 +3812,7 @@ def main():
                         "pdf_method": "", "telegram_attempts": 0, "pdf_sent": False,
                         "upload_date": candidate.get("upload_date"),
                         "last_error": f"Stale (limit={STALE_NOTICE_DAYS}d)",
+                        "etag": None, "last_modified": None, "pdf_hash": None, "pdf_hash_kind": None, "last_content_check_at": None,
                     }
                     site_items_list.append((iid, candidate["title"], candidate["url"]))
                     continue
@@ -3169,23 +3829,68 @@ def main():
                     "pdf_method": "", "telegram_attempts": 0, "pdf_sent": False,
                     "upload_date": candidate.get("upload_date"),
                     "last_error": None,
+                    "etag": None, "last_modified": None, "pdf_hash": None, "pdf_hash_kind": None, "last_content_check_at": None,
                 }
                 state["items"][iid] = record
                 site_items_list.append((iid, record["title"], record["url"]))
             else:
                 record["last_seen"] = utc_now()
 
+                if record.get("status") in ("sent", "ignored"):
+                    # last_seen changes on every scan, so it must not be used as the
+                    # validator-check clock. Track the last check independently.
+                    should_check = True
+                    try:
+                        checked_at = record.get("last_content_check_at")
+                        if checked_at:
+                            checked_dt = datetime.fromisoformat(checked_at.replace("Z", "+00:00"))
+                            if checked_dt.tzinfo is None:
+                                checked_dt = checked_dt.replace(tzinfo=timezone.utc)
+                            age_days = (datetime.now(timezone.utc) - checked_dt).total_seconds() / 86400
+                            should_check = age_days >= ETAG_CHECK_MAX_AGE_DAYS
+                    except Exception:
+                        should_check = True
+
+                    if should_check:
+                        session = make_session()
+                        try:
+                            changed, new_etag, new_lm = _check_url_changed(
+                                session, candidate["url"], record
+                            )
+                            if changed:
+                                print(f"[UPDATE] Content changed: {candidate['url'][:80]}", file=sys.stderr)
+                                record["status"] = "pending"
+                                record.pop("terminal_at", None)
+                                record["attempts"] = 0
+                                record["last_error"] = None
+                                record["pdf_extracted"] = False
+                                record["pdf_text"] = ""
+                                record["pdf_attempts"] = 0
+                                record["classification"] = None
+                                record["summary"] = ""
+                            if new_etag:
+                                record["etag"] = new_etag
+                            if new_lm:
+                                record["last_modified"] = new_lm
+                            record["last_content_check_at"] = utc_now()
+                        except Exception as exc:
+                            print(f"[WARN] ETag check failed: {exc}", file=sys.stderr)
+                        finally:
+                            session.close()
+
                 if record.get("status") == "baseline":
                     old_title = (record.get("title") or "").strip()
                     new_title = (candidate.get("title") or "").strip()
-                    if old_title and new_title and old_title != new_title and len(new_title) >= 8:
+                    old_context = record.get("context", "")
+                    new_context = candidate.get("context", "")
+                    if _meaningful_metadata_change(old_title, new_title, old_context, new_context):
                         record["status"] = "pending"
                         record["attempts"] = 0
                         record["last_error"] = None
                         record["pdf_extracted"] = False
                         record["pdf_text"] = ""
                         record["pdf_attempts"] = 0
-                        print(f"[RE-PROCESS] Title changed: {new_title[:80]}")
+                        print(f"[RE-PROCESS] Substantive baseline metadata change: {new_title[:80]}")
 
                 if candidate["title"]:
                     record["title"] = candidate["title"]
@@ -3204,14 +3909,26 @@ def main():
             ):
                 pending.append((iid, record))
 
+    # Sweep ALL persisted pending records, not only candidates visible in this scan.
+    # This prevents pending notices getting stranded when a district site is down or
+    # a listing page changes before the next successful run.
+    pending = enqueue_persisted_pending(
+        state,
+        pending,
+        scan["max_pending_attempts"],
+        {site["id"] for site in cfg["websites"]},
+    )
+
     state["initialized"] = all(
         site_state(state, site["id"])["baseline_complete"] for site in cfg["websites"]
     )
 
-    pending.sort(key=lambda pair: pair[1].get("first_seen", ""), reverse=True)
-    pending.sort(key=lambda pair: -local_score(
-        pair[1]["title"], pair[1]["url"], pair[1].get("context", ""), scan["keywords"],
-    ))
+    # One record may be discovered through multiple archive pages. Classify it once/run.
+    pending = list({iid: record for iid, record in pending}.items())
+    pending.sort(
+        key=lambda pair: pending_priority(pair[1], scan["keywords"]),
+        reverse=True,
+    )
     max_items_this_run = min(
         scan["gemini_batch_size"] * scan["gemini_max_calls_per_run"],
         40,
@@ -3234,6 +3951,10 @@ def main():
                 [record for _, record in batch], gemini_key, scan["request_timeout_seconds"],
             )
             for index, (_, record) in enumerate(batch):
+                # _fetch_pdfs_for_batch may have conclusively marked a PDF stale.
+                # Do not let Gemini overwrite that decision later in this run.
+                if record.get("status") == "baseline" and str(record.get("last_error", "")).startswith("PDF content stale"):
+                    continue
                 record["attempts"] = int(record.get("attempts", 0)) + 1
                 classification = result.get(str(index))
                 if classification is None:
@@ -3258,7 +3979,8 @@ def main():
         (iid, record)
         for iid, record in state["items"].items()
         if record.get("status") == "ready"
-        and int(record.get("telegram_attempts", 0)) < 10
+        and int(record.get("telegram_attempts", 0) or 0) < TELEGRAM_MAX_ATTEMPTS
+        and _telegram_retry_due(record)
     ]
     ready.sort(key=lambda pair: pair[1].get("first_seen", ""), reverse=True)
 
@@ -3289,43 +4011,48 @@ def main():
         if ok:
             record["status"] = "sent"
             record["last_error"] = None
+            record.pop("telegram_next_attempt_at", None)
+            record.pop("telegram_first_failed_at", None)
             sent_count += 1
         elif permanent:
             record["status"] = "permanent_error"
             record["last_error"] = detail
+            record.pop("telegram_next_attempt_at", None)
             run_errors += 1
             print(f"[ERROR] Permanent Telegram error: {detail}", file=sys.stderr)
         else:
             record["status"] = "ready"
             record["last_error"] = detail
+            _schedule_telegram_retry(record)
             run_errors += 1
-            print(f"[WARN] Telegram delivery failed; will retry: {detail}", file=sys.stderr)
+            print(
+                f"[WARN] Telegram delivery failed; retry scheduled at "
+                f"{record.get('telegram_next_attempt_at')}: {detail}", file=sys.stderr
+            )
 
-    # Health alert
     try:
-        if sent_count == 0:
-            last_notify_str = state.get("last_successful_notify_at")
-            should_alert = False
-            if last_notify_str:
-                try:
-                    last_dt = datetime.fromisoformat(last_notify_str.replace("Z", "+00:00"))
-                    if last_dt.tzinfo is None:
-                        last_dt = last_dt.replace(tzinfo=timezone.utc)
-                    hours_since = (datetime.now(timezone.utc) - last_dt).total_seconds() / 3600
-                    if hours_since >= 24:
-                        should_alert = True
-                except Exception:
-                    pass
-
-            if should_alert:
-                alert_msg = (
-                    f"⚠️ <b>Monitor Health Alert</b>\n\n"
-                    f"Last 24 hours me koi notice nahi mila.\n"
-                    f"Last successful delivery: {last_notify_str or 'unknown'}"
-                )
-                send_telegram(token, chat_id, alert_msg)
-                print("[ALERT] 24h no notices", file=sys.stderr)
-        else:
+        # No new notice for a day is normal on district sites. Alert only when this
+        # run actually had errors, and rate-limit the alert to avoid notification fatigue.
+        should_alert = run_errors > 0
+        last_health_alert = state.get("last_health_alert_at")
+        if last_health_alert:
+            health_dt = _parse_utc_timestamp(last_health_alert)
+            if health_dt and (datetime.now(timezone.utc) - health_dt).total_seconds() < 24 * 3600:
+                should_alert = False
+        if should_alert:
+            alert_msg = (
+                f"⚠️ <b>Monitor Health Alert</b>\n\n"
+                f"Is run me {run_errors} error(s) record hue.\n"
+                f"Delivered notices in this run: {sent_count}.\n"
+                f"Run time: {state.get('last_run', 'unknown')}"
+            )
+            ok, _permanent, detail = send_telegram(token, chat_id, alert_msg)
+            if ok:
+                state["last_health_alert_at"] = utc_now()
+                print(f"[ALERT] Run completed with {run_errors} error(s)", file=sys.stderr)
+            else:
+                print(f"[WARN] Health alert not delivered: {detail}", file=sys.stderr)
+        if sent_count > 0:
             state["last_successful_notify_at"] = utc_now()
     except Exception as exc:
         print(f"[WARN] Health alert check failed: {exc}", file=sys.stderr)
@@ -3334,15 +4061,24 @@ def main():
 
     try:
         state["stats"]["errors"] = int(state["stats"].get("errors", 0)) + run_errors
+        prune_state(
+            state,
+            scan["retention_days"],
+            scan["max_state_items"],
+            scan["max_pending_attempts"],
+            scan["max_state_bytes"],
+        )
         refresh_stats(state)
-        prune_state(state, scan["retention_days"])
-        atomic_save_json(STATE_FILE, state)
-    except Exception as exc:
-        print(f"[FATAL] State save failed: {exc}", file=sys.stderr)
+        atomic_save_json(STATE_FILE, state, max_bytes=scan["max_state_bytes"])
         try:
-            atomic_save_json(STATE_FILE, state)
-        except Exception:
+            print(f"[STATE] records={len(state.get('items', {}))} bytes={STATE_FILE.stat().st_size}")
+        except OSError:
             pass
+    except Exception as exc:
+        # A failed save must fail the process. Never retry an unchecked save here:
+        # it could overwrite the last known-good state with an oversized/broken file.
+        print(f"[FATAL] State save failed: {exc}", file=sys.stderr)
+        return 1
 
     elapsed = _time.monotonic() - _START_TIME
     print(
