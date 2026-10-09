@@ -21,7 +21,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 1
+
+      - name: Load persistent monitor state
+        id: load_state
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git ls-remote --heads origin monitor-state > /tmp/monitor-state-ref.txt
+
+          if [ -s /tmp/monitor-state-ref.txt ]; then
+            git fetch --no-tags origin monitor-state
+            git show FETCH_HEAD:state.json > state.json
+            test -s state.json
+            echo "Loaded state from monitor-state branch"
+          elif [ -f state.json ]; then
+            echo "No monitor-state branch yet; migrating existing repository state.json"
+          else
+            echo "No prior state found; monitor will initialize a new state file"
+          fi
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -50,22 +69,55 @@ jobs:
         run: |
           python monitor.py
 
-      - name: Commit state
-        if: always()
+      - name: Persist state in a single-commit branch
+        if: ${{ always() && steps.load_state.outcome == 'success' }}
+        shell: bash
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add state.json
-          git diff --cached --quiet || \
-            git commit -m "chore: update notification state"
+          set -euo pipefail
 
-      - name: Rebase and push state
-        if: always()
-        run: |
-          for i in 1 2 3 4 5; do
-            git fetch origin "${GITHUB_REF_NAME}" && \
-              git rebase "origin/${GITHUB_REF_NAME}" && \
-              git push origin "HEAD:${GITHUB_REF_NAME}" && break
-            echo "Push attempt $i failed, retrying in 5s..."
-            sleep 5
+          if [ ! -s state.json ]; then
+            echo "::error::state.json is missing or empty; refusing to overwrite persistent state"
+            exit 1
+          fi
+
+          python -m json.tool state.json >/dev/null || {
+            echo "::error::state.json is invalid JSON; refusing to overwrite persistent state"
+            exit 1
+          }
+
+          state_bytes=$(wc -c < state.json | tr -d ' ')
+
+          if [ "$state_bytes" -gt 3100000 ]; then
+            echo "::error::state.json exceeds the 3.1 MB persistence guard (${state_bytes} bytes); previous monitor-state branch will be preserved"
+            exit 1
+          fi
+
+          echo "State size accepted: ${state_bytes} bytes"
+          cp state.json /tmp/jharkhand-monitor-state.json
+
+          git switch --orphan state-update
+          git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/jharkhand-monitor-state.json state.json
+          git add state.json
+
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -m "Update monitor state"
+
+          pushed=false
+
+          for i in 1 2 3; do
+            if git push --force origin HEAD:monitor-state; then
+              pushed=true
+              echo "State push succeeded on attempt $i"
+              break
+            fi
+
+            echo "State push attempt $i failed; retrying..."
+            sleep 4
           done
+
+          if [ "$pushed" != "true" ]; then
+            echo "::error::Could not persist monitor-state after 3 attempts"
+            exit 1
+          fi
