@@ -1469,7 +1469,32 @@ def extract_candidates(html_text, page_url, site, scan):
         if _is_navigation_url(href):
             continue
         title = clean_text(a.get_text(" ", strip=True), 300)
-        if _is_generic_title(title):
+
+        # Generic titles alone should not disqualify a link when the URL
+        # itself is clearly a notice/document endpoint. This fixes sites
+        # (e.g. Ranchi) where notice anchors use labels like "View" or
+        # "Read More" and were previously filtered out before scoring.
+        href_lower_early = href.lower()
+        url_looks_like_notice = (
+            "/notice/" in href_lower_early
+            or "/notices/" in href_lower_early
+            or "/document/" in href_lower_early
+            or "/documents/" in href_lower_early
+            or "/writereaddata/" in href_lower_early
+            or "/uploadfile/" in href_lower_early
+            or "/uploads/" in href_lower_early
+            or "/downloadfile/" in href_lower_early
+            or "/download_file/" in href_lower_early
+            or "/getfile/" in href_lower_early
+            or "/showfile/" in href_lower_early
+            or "/viewfile/" in href_lower_early
+            or "/filedownload/" in href_lower_early
+            or ".pdf" in href_lower_early
+            or "post_type=notice" in href_lower_early
+            or "post_type=document" in href_lower_early
+        )
+
+        if _is_generic_title(title) and not url_looks_like_notice:
             continue
 
         parent = a.find_parent("tr")
