@@ -95,6 +95,13 @@ jobs:
           echo "State size accepted: ${state_bytes} bytes"
           cp state.json /tmp/jharkhand-monitor-state.json
 
+          # Discard local modifications to tracked files (state.json) since we
+          # already backed up the updated content to /tmp. Without this, git
+          # refuses to switch to the orphan branch because state.json has
+          # uncommitted changes that would be overwritten.
+          git checkout -- . 2>/dev/null || true
+          git clean -fd 2>/dev/null || true
+
           git switch --orphan state-update
           git rm -rf . >/dev/null 2>&1 || true
           cp /tmp/jharkhand-monitor-state.json state.json
