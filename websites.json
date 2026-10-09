@@ -53,7 +53,14 @@
     { "id": "pakur", "name": "Pakur District", "url": "https://pakur.nic.in/", "enabled": true },
     { "id": "palamu", "name": "Palamu District", "url": "https://palamu.nic.in/", "enabled": true },
     { "id": "ramgarh", "name": "Ramgarh District", "url": "https://ramgarh.nic.in/", "enabled": true },
-    { "id": "ranchi", "name": "Ranchi District", "url": "https://ranchi.nic.in/", "enabled": true },
+    {
+      "id": "ranchi",
+      "name": "Ranchi District",
+      "url": "https://ranchi.nic.in/",
+      "enabled": true,
+      "keywords": ["ranchi", "रांची", "राँची"],
+      "discovery_keywords": ["notice", "recruitment", "tender", "result", "सूचना", "भर्ती", "निविदा"]
+    },
     { "id": "sahibganj", "name": "Sahibganj District", "url": "https://sahibganj.nic.in/", "enabled": true },
     { "id": "seraikela", "name": "Saraikela Kharsawan District", "url": "https://seraikela.nic.in/", "enabled": true },
     { "id": "simdega", "name": "Simdega District", "url": "https://simdega.nic.in/", "enabled": true },
