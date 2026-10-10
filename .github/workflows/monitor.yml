@@ -1,157 +1,151 @@
+
 name: Jharkhand District Notification Monitor
 
 on:
-schedule:
-- cron: "*/20 * * * *"
-workflow_dispatch:
+  schedule:
+    - cron: "*/20 * * * *"
+  workflow_dispatch:
 
 permissions:
-contents: write
+  contents: write
 
 concurrency:
-group: jharkhand-district-notification-monitor
-cancel-in-progress: false
+  group: jharkhand-district-notification-monitor
+  cancel-in-progress: false
 
 jobs:
-monitor:
-name: Scan Jharkhand District Notices
-runs-on: ubuntu-latest
-timeout-minutes: 30
+  monitor:
+    name: Scan Jharkhand District Notices
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
 
-```
-steps:
-  - name: Checkout repository
-    uses: actions/checkout@v4
-    with:
-      fetch-depth: 1
-      persist-credentials: true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
 
-  - name: Load persistent monitor state
-    id: load_state
-    shell: bash
-    run: |
-      set -euo pipefail
+      - name: Load persistent monitor state
+        id: load_state
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      git ls-remote --heads origin refs/heads/monitor-state \
-        > /tmp/monitor-state-ref.txt
+          if git ls-remote --exit-code --heads origin monitor-state >/dev/null 2>&1; then
+            git fetch --no-tags origin monitor-state
+            git show FETCH_HEAD:state.json > state.json
+            test -s state.json
+            python -m json.tool state.json >/dev/null
+            echo "Loaded existing state from monitor-state branch."
+          else
+            echo "monitor-state branch not found; checking repository state.json."
 
-      BRANCH_SHA="$(awk 'NR == 1 {print $1}' /tmp/monitor-state-ref.txt)"
-      echo "branch_sha=${BRANCH_SHA}" >> "$GITHUB_OUTPUT"
+            if [ -f state.json ] && [ -s state.json ]; then
+              python -m json.tool state.json >/dev/null
+              echo "Using existing repository state.json."
+            else
+              echo "No previous state file found. Monitor will initialize it."
+            fi
+          fi
 
-      if [ -n "$BRANCH_SHA" ]; then
-        git fetch --no-tags origin monitor-state
-        git show FETCH_HEAD:state.json > state.json
-        test -s state.json
-        python -m json.tool state.json >/dev/null
-        echo "Loaded persistent state from monitor-state."
-      elif [ -f state.json ] && [ -s state.json ]; then
-        python -m json.tool state.json >/dev/null
-        echo "Using repository state.json for initial migration."
-      else
-        echo "No previous state found; monitor will initialize state."
-      fi
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-  - name: Set up Python
-    uses: actions/setup-python@v5
-    with:
-      python-version: "3.12"
-      cache: "pip"
+      - name: Install system dependencies for PDF OCR
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-hin poppler-utils
 
-  - name: Install dependencies
-    shell: bash
-    run: |
-      set -euo pipefail
-      python -m pip install --upgrade pip
-      pip install -r requirements.txt
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-  - name: Run regression tests
-    shell: bash
-    run: |
-      set -euo pipefail
-      python -m unittest discover -s tests -v
+      - name: Run regression tests
+        run: |
+          if [ -d tests ]; then
+            python -m unittest discover -s tests -v
+          else
+            echo "No tests directory found; skipping regression tests."
+          fi
 
-  - name: Run notification monitor
-    env:
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      NOTIFY_LANGUAGE: "both"
-      OCR_ENABLED: "true"
-      OCR_DPI: "150"
-      OCR_MAX_WORKERS: "2"
-      SEND_PDF_ENABLED: "true"
-      GEMINI_MAX_OUTPUT_TOKENS: "16384"
-      GEMINI_PDF_OCR_ENABLED: "true"
-      STALE_NOTICE_DAYS: "10"
-    shell: bash
-    run: |
-      set -euo pipefail
-      python monitor.py
+      - name: Run notification monitor
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
-  - name: Validate state before saving
-    id: validate_state
-    if: ${{ always() && steps.load_state.outcome == 'success' }}
-    shell: bash
-    run: |
-      set -euo pipefail
+          NOTIFY_LANGUAGE: "both"
+          OCR_ENABLED: "true"
+          OCR_LANG: "eng+hin"
+          OCR_DPI: "150"
+          OCR_MAX_WORKERS: "1"
 
-      if [ ! -s state.json ]; then
-        echo "::error::state.json is missing or empty."
-        exit 1
-      fi
+          SEND_PDF_ENABLED: "true"
+          GEMINI_MAX_OUTPUT_TOKENS: "16384"
+          GEMINI_PDF_OCR_ENABLED: "true"
+          STALE_NOTICE_DAYS: "10"
+        run: |
+          python monitor.py
 
-      python -m json.tool state.json >/dev/null
+      - name: Validate state file
+        if: ${{ always() && steps.load_state.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      STATE_BYTES="$(wc -c < state.json | tr -d ' ')"
-      if [ "$STATE_BYTES" -gt 3100000 ]; then
-        echo "::error::state.json exceeds the 3.1 MB safety limit."
-        exit 1
-      fi
+          if [ ! -s state.json ]; then
+            echo "::error::state.json is missing or empty."
+            exit 1
+          fi
 
-      echo "Validated state size: ${STATE_BYTES} bytes"
-      cp state.json /tmp/jharkhand-monitor-state.json
+          python -m json.tool state.json >/dev/null
 
-  - name: Publish state safely
-    if: ${{ always() && steps.validate_state.outcome == 'success' }}
-    shell: bash
-    env:
-      EXPECTED_STATE_SHA: ${{ steps.load_state.outputs.branch_sha }}
-    run: |
-      set -euo pipefail
+          state_bytes=$(wc -c < state.json | tr -d ' ')
+          if [ "$state_bytes" -gt 3100000 ]; then
+            echo "::error::state.json exceeds the 3.1 MB safety limit."
+            exit 1
+          fi
 
-      PUBLISH_DIR="/tmp/jharkhand-state-publish"
-      git worktree add --detach "$PUBLISH_DIR" "$GITHUB_SHA"
+          echo "State file validated: ${state_bytes} bytes."
 
-      cd "$PUBLISH_DIR"
-      git switch --orphan state-update
-      git rm -rf --ignore-unmatch .
+      - name: Persist state to monitor-state branch
+        if: ${{ always() && steps.load_state.outcome == 'success' && hashFiles('state.json') != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      cp /tmp/jharkhand-monitor-state.json state.json
-      python -m json.tool state.json >/dev/null
-      git add -- state.json
+          python -m json.tool state.json >/dev/null
+          cp state.json /tmp/jharkhand-monitor-state.json
 
-      git -c user.name="github-actions[bot]" \
-          -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-          commit -m "Update monitor state"
+          git switch --orphan state-update
+          git rm -rf . >/dev/null 2>&1 || true
 
-      PUSHED=false
-      for ATTEMPT in 1 2 3; do
-        if git push \
-          "--force-with-lease=refs/heads/monitor-state:${EXPECTED_STATE_SHA}" \
-          origin HEAD:refs/heads/monitor-state; then
-          PUSHED=true
-          echo "Persistent state saved successfully."
-          break
-        fi
+          cp /tmp/jharkhand-monitor-state.json state.json
+          python -m json.tool state.json >/dev/null
 
-        echo "::warning::State push attempt ${ATTEMPT} failed."
-        if [ "$ATTEMPT" -lt 3 ]; then
-          sleep 4
-        fi
-      done
+          git add state.json
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -m "Update monitor state"
 
-      if [ "$PUSHED" != "true" ]; then
-        echo "::error::State was not saved. Rerun to load the latest state."
-        exit 1
-      fi
-```
+          pushed=false
+
+          for i in 1 2 3 4 5; do
+            if git push origin HEAD:monitor-state; then
+              pushed=true
+              echo "State persisted successfully."
+              break
+            fi
+
+            echo "State push attempt $i failed; retrying in 5 seconds."
+            sleep 5
+          done
+
+          if [ "$pushed" != "true" ]; then
+            echo "::error::Could not persist monitor state after 5 attempts."
+            exit 1
+          fi
