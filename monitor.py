@@ -46,8 +46,6 @@ FALLBACK_MODELS = [
     "gemini-3.1-flash-lite",
 ]
 
-# Conservative title matching: URLs/paths still carry weight, but HTML/PDF
-# representations of the same notice can live at completely different paths.
 FUZZY_DUPLICATE_THRESHOLD = 94
 FUZZY_CROSS_PATH_THRESHOLD = 96
 TELEGRAM_MAX_ATTEMPTS = 100
@@ -100,6 +98,10 @@ STRONG_KEYWORDS = [
 
 _RUNTIME_PDF_CACHE: Dict[str, bytes] = {}
 _GEMINI_API_KEY = ""
+_GEMINI_KEYS_POOL: List[str] = []
+_GEMINI_KEY_INDEX: int = 0
+_GEMINI_DEAD_KEYS: set = set()
+_GEMINI_KEY_LOCK = __import__("threading").Lock()
 
 _MODELS_DISCOVERED: bool = False
 _DYNAMIC_MODELS: List[str] = []
@@ -133,6 +135,101 @@ def _cache_put(url, content):
     _RUNTIME_PDF_CACHE[url] = content
 
 
+def _load_gemini_keys():
+    keys = []
+    seen = set()
+
+    def add(raw):
+        key = (raw or "").strip()
+        if key and key not in seen:
+            seen.add(key)
+            keys.append(key)
+
+    for part in os.getenv("GEMINI_API_KEYS", "").split(","):
+        add(part)
+    for i in range(1, 11):
+        add(os.getenv(f"GEMINI_API_KEY_{i}", ""))
+    add(os.getenv("GEMINI_API_KEY", ""))
+    return keys
+
+
+def _get_next_gemini_key():
+    global _GEMINI_KEY_INDEX
+    with _GEMINI_KEY_LOCK:
+        total = len(_GEMINI_KEYS_POOL)
+        if not total:
+            return None
+        for _ in range(total):
+            idx = _GEMINI_KEY_INDEX % total
+            _GEMINI_KEY_INDEX = (idx + 1) % total
+            key = _GEMINI_KEYS_POOL[idx]
+            if key not in _GEMINI_DEAD_KEYS:
+                return key
+    return None
+
+
+def _has_live_gemini_keys():
+    with _GEMINI_KEY_LOCK:
+        return any(key not in _GEMINI_DEAD_KEYS for key in _GEMINI_KEYS_POOL)
+
+
+def _mark_gemini_key_dead(key, reason="quota exhausted"):
+    if not key:
+        return
+    with _GEMINI_KEY_LOCK:
+        if key in _GEMINI_DEAD_KEYS:
+            return
+        _GEMINI_DEAD_KEYS.add(key)
+        remaining = max(0, len(_GEMINI_KEYS_POOL) - len(_GEMINI_DEAD_KEYS))
+    try:
+        index = _GEMINI_KEYS_POOL.index(key) + 1
+    except ValueError:
+        index = 0
+    print(f"[GEMINI] Key #{index} skipped for this run ({reason}); {remaining} key(s) remain.", file=sys.stderr)
+
+
+def _gemini_post_with_rotation(endpoint, payload, timeout):
+    if not _GEMINI_KEYS_POOL:
+        return None, None, "no_keys"
+    attempted = set()
+    last_reason = "all_keys_failed"
+    for _ in range(len(_GEMINI_KEYS_POOL)):
+        key = _get_next_gemini_key()
+        if key is None:
+            return None, None, "all_keys_quota_exhausted"
+        if key in attempted:
+            continue
+        attempted.add(key)
+        headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
+        try:
+            response = requests.post(endpoint, headers=headers, json=payload, timeout=timeout)
+        except requests.RequestException as exc:
+            last_reason = "network_error"
+            print(f"[WARN] Gemini network error on key #{_GEMINI_KEYS_POOL.index(key)+1}: {type(exc).__name__}", file=sys.stderr)
+            continue
+        if response.status_code == 429:
+            try:
+                err = response.json().get("error", {})
+                msg = str(err.get("message", "")).lower()
+                status = str(err.get("status", "")).upper()
+            except Exception:
+                msg, status = response.text.lower(), ""
+            quota = status == "RESOURCE_EXHAUSTED" or any(term in msg for term in ("quota", "daily limit", "per day", "limit: 0"))
+            if quota:
+                _mark_gemini_key_dead(key, "quota exhausted")
+                last_reason = "quota_exhausted"
+                continue
+            last_reason = "rate_limited"
+            print(f"[WARN] Gemini key #{_GEMINI_KEYS_POOL.index(key)+1} rate-limited; trying another key.", file=sys.stderr)
+            continue
+        if response.status_code in (401, 403):
+            _mark_gemini_key_dead(key, f"HTTP {response.status_code} authentication/permission failure")
+            last_reason = "key_rejected"
+            continue
+        return response, key, None
+    return None, None, last_reason
+
+
 def _discover_models():
     global _MODELS_DISCOVERED, _DYNAMIC_MODELS
 
@@ -142,10 +239,38 @@ def _discover_models():
     print("[INFO] Discovering available Gemini models...", file=sys.stderr)
 
     try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={_GEMINI_API_KEY}"
-        response = requests.get(url, timeout=15)
-        response.raise_for_status()
-        data = response.json()
+        data = None
+        for _ in range(max(1, len(_GEMINI_KEYS_POOL))):
+            key = _get_next_gemini_key()
+            if key is None:
+                break
+            try:
+                response = requests.get(
+                    "https://generativelanguage.googleapis.com/v1beta/models",
+                    headers={"x-goog-api-key": key}, timeout=15,
+                )
+                if response.status_code == 429:
+                    try:
+                        err = response.json().get("error", {})
+                        msg = str(err.get("message", "")).lower()
+                        status = str(err.get("status", "")).upper()
+                    except Exception:
+                        msg, status = response.text.lower(), ""
+                    if status == "RESOURCE_EXHAUSTED" or any(t in msg for t in ("quota", "daily limit", "per day", "limit: 0")):
+                        _mark_gemini_key_dead(key, "model-discovery quota exhausted")
+                    else:
+                        print(f"[WARN] Model discovery rate-limited for key #{_GEMINI_KEYS_POOL.index(key)+1}", file=sys.stderr)
+                    continue
+                if response.status_code in (401, 403):
+                    _mark_gemini_key_dead(key, f"model-discovery HTTP {response.status_code}")
+                    continue
+                response.raise_for_status()
+                data = response.json()
+                break
+            except Exception as exc:
+                print(f"[WARN] Model discovery failed for key #{_GEMINI_KEYS_POOL.index(key)+1}: {type(exc).__name__}", file=sys.stderr)
+        if data is None:
+            raise RuntimeError("No configured Gemini key succeeded during model discovery")
 
         valid_models = []
         for model in data.get("models", []):
@@ -187,12 +312,6 @@ def _discover_models():
 
 
 def _pdf_content_fingerprint(content):
-    """Fingerprint rendered PDF pages so metadata-only re-exports do not look changed.
-
-    Uses low-resolution rendered pixels (including scanned/image-only PDFs) and ignores
-    PDF metadata such as CreationDate/Producer. Falls back to normalized extracted text,
-    then raw bytes only when neither rendering nor text extraction is available.
-    """
     if not content:
         return ""
     if fitz is not None:
@@ -233,7 +352,6 @@ def _parse_utc_timestamp(value):
 
 
 def _telegram_retry_due(record, now=None):
-    """Return False while a failed Telegram delivery is in its backoff window."""
     now = now or datetime.now(timezone.utc)
     first_failed = _parse_utc_timestamp(record.get("telegram_first_failed_at"))
     if first_failed and (now - first_failed).total_seconds() > TELEGRAM_RETRY_WINDOW_HOURS * 3600:
@@ -243,7 +361,6 @@ def _telegram_retry_due(record, now=None):
 
 
 def _schedule_telegram_retry(record, now=None):
-    """Persist bounded exponential retry timing across scheduled workflow runs."""
     now = now or datetime.now(timezone.utc)
     if not record.get("telegram_first_failed_at"):
         record["telegram_first_failed_at"] = now.isoformat()
@@ -256,7 +373,6 @@ def _schedule_telegram_retry(record, now=None):
 
 
 def _meaningful_metadata_change(old_title, new_title, old_context, new_context):
-    """Ignore cosmetic churn; detect substantive text and critical-field changes."""
     details = meaningful_change_details("\n".join([old_title or "", old_context or ""]),
                                         "\n".join([new_title or "", new_context or ""]))
     if details:
@@ -290,7 +406,6 @@ MEANINGFUL_FIELDS = {
 }
 
 def extract_meaningful_fields(text):
-    """Extract comparable high-value notice fields without trusting raw file hashes."""
     source = clean_text(text or "", 12000).casefold()
     found = {}
     for field, patterns in MEANINGFUL_FIELDS.items():
@@ -309,7 +424,6 @@ def meaningful_change_details(old_text, new_text):
     changed = {k: {"old": old_fields.get(k), "new": new_fields.get(k)}
                for k in set(old_fields) | set(new_fields)
                if old_fields.get(k) != new_fields.get(k)}
-    # Raw title/context comparison remains a fallback when field extraction is sparse.
     if not changed:
         old_norm = re.sub(r"\s+", " ", (old_text or "").casefold()).strip()
         new_norm = re.sub(r"\s+", " ", (new_text or "").casefold()).strip()
@@ -320,11 +434,9 @@ def meaningful_change_details(old_text, new_text):
     return changed
 
 def baseline_can_complete(scan_success, errors):
-    """A baseline is complete only after a successful scan with no partial errors."""
     return bool(scan_success) and not bool(errors)
 
 def add_review_item(state, record, reason, details=None):
-    """Persist ambiguous/failed records for manual audit instead of silently dropping them."""
     queue = state.setdefault("review_queue", {})
     key = hashlib.sha256((record.get("site_id", "") + "|" + record.get("url", "")).encode("utf-8")).hexdigest()
     previous = queue.get(key, {})
@@ -341,7 +453,6 @@ def add_review_item(state, record, reason, details=None):
 
 
 def _check_url_changed(session, url, record):
-    """Cheap HEAD check using ETag/Last-Modified for silent content changes."""
     try:
         head = session.head(url, timeout=8, allow_redirects=True)
         new_etag = head.headers.get("etag")
@@ -356,13 +467,6 @@ def _check_url_changed(session, url, record):
         elif new_lm and old_lm and new_lm != old_lm:
             changed = True
 
-        # PDF ETag/Last-Modified headers are only hints: some servers keep them
-        # unchanged even when the PDF content changes, while others regenerate PDF
-        # metadata without changing the visible notice. Therefore fingerprint every
-        # PDF during this scheduled validator check (currently throttled by
-        # ETAG_CHECK_MAX_AGE_DAYS at the call site) and use comparable fingerprints
-        # as the source of truth. If download/fingerprinting fails, retain the header
-        # signal rather than falsely claiming that the PDF is unchanged.
         if record.get("is_pdf"):
             try:
                 with session.get(url, timeout=20, allow_redirects=True, stream=True) as response:
@@ -388,14 +492,9 @@ def _check_url_changed(session, url, record):
                             old_kind = record.get("pdf_hash_kind")
                             new_kind = new_hash.split(":", 1)[0]
                             if old_hash and old_kind == new_kind:
-                                # Semantic fingerprints supersede metadata headers.
                                 changed = new_hash != old_hash
                             elif old_hash and not old_kind:
-                                # Legacy state stored raw-byte SHA-256. Do not emit a
-                                # one-time false alert during fingerprint migration.
                                 changed = False
-                            # If there is no comparable previous fingerprint, retain
-                            # the ETag/Last-Modified signal; save the new baseline below.
                             record["pdf_hash"] = new_hash
                             record["pdf_hash_kind"] = new_kind
             except Exception as exc:
@@ -481,7 +580,6 @@ _EMPTY_PAGE_PHRASES = [
 
 
 def _is_navigation_url(url):
-    """Blocks URL from becoming a notice candidate."""
     try:
         parsed = urlparse(url)
         target = (parsed.path or "") + ("?" + parsed.query if parsed.query else "")
@@ -494,8 +592,6 @@ def _is_navigation_url(url):
 
 
 def _is_archive_url(url):
-    """Archive/listing/pagination URL — FETCH allowed, but
-    individual notices inside will become candidates."""
     try:
         parsed = urlparse(url)
         target = (parsed.path or "") + ("?" + parsed.query if parsed.query else "")
@@ -870,14 +966,12 @@ _UPLOAD_DATE_TEXT_PATTERNS = [
 
 
 def _extract_explicit_issue_dates(text):
-    """Only dates explicitly labelled as publication/issue dates count as stale evidence."""
     if not text:
         return []
     dates = []
     for pattern in _UPLOAD_DATE_TEXT_PATTERNS:
         for match in pattern.finditer(text):
             dates.extend(_extract_full_dates(match.group(1)))
-    # Stable de-duplication of date values.
     return sorted(set(dates))
 
 
@@ -920,13 +1014,6 @@ def _extract_upload_date(anchor_tag):
 
 
 def _is_stale_notice(title, context, url, upload_date=None, pdf_text=None):
-    """Reject old notices using publication dates, not unrelated exam/deadline dates.
-
-    Priority: explicit issue/publication date in the notice, then listing upload date.
-    If neither exists, an old-only year hint in title/context/URL is a conservative
-    fallback. A current-year hint (e.g. "2023 batch revised 2026") keeps a possible
-    current update eligible for processing.
-    """
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=STALE_NOTICE_DAYS)
     title_text = str(title or "")
@@ -935,17 +1022,9 @@ def _is_stale_notice(title, context, url, upload_date=None, pdf_text=None):
     haystack = f"{title_text} {context_text} {url_text}".strip()
     full_text = f"{haystack} {pdf_text or ''}".strip()
 
-    # Strong archive-title gate: a clearly historical year/range in the actual
-    # candidate title must not be overridden by the current year in a site's
-    # generic footer, navigation, or broad scraped context. Only explicit evidence
-    # of a current-year revision/update in the title or notice-specific context can
-    # keep such an archive item eligible.
     title_years = [int(y) for y in re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", title_text)]
     current_year = now.year
     update_words = r"(?:updated|update|revised|revision|corrigendum|addendum|amended|modified|नया संशोधन|संशोधित|अद्यतन|शुद्धिपत्र)"
-    # A title is strong archive evidence when it has an explicit old-year range,
-    # or its only year is at least two years old. A recent listing timestamp can
-    # still validate a single previous-year batch title.
     current_year_update = bool(re.search(
         rf"(?:revised|revision|corrigendum|addendum|amended|modified|संशोधित|शुद्धिपत्र).{{0,50}}{current_year}|{current_year}.{{0,50}}(?:revised|revision|corrigendum|addendum|amended|modified|संशोधित|शुद्धिपत्र)",
         f"{title_text} {context_text}", re.I
@@ -955,14 +1034,11 @@ def _is_stale_notice(title, context, url, upload_date=None, pdf_text=None):
     if (title_has_old_range or title_has_very_old_year) and not current_year_update:
         return True
 
-    # Do not let a future application deadline or exam date hide an old publication
-    # date. Only dates explicitly labelled as publication/issue dates count here.
     issue_dates = _extract_explicit_issue_dates(full_text)
     past_issue_dates = [d for d in issue_dates if d <= now]
     if past_issue_dates:
         return max(past_issue_dates) < cutoff
     if issue_dates:
-        # Only future explicit issue dates were found; do not classify as stale.
         return False
 
     if upload_date is not None:
@@ -972,8 +1048,6 @@ def _is_stale_notice(title, context, url, upload_date=None, pdf_text=None):
             upload_date = upload_date.astimezone(timezone.utc)
         return upload_date < cutoff
 
-    # Fallback for archived entries with no publication metadata. Do not reject a
-    # mixed/updated notice such as "2023 batch revised in 2026".
     years = [int(y) for y in re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", full_text)]
     if years and max(years) < now.year:
         return True
@@ -1004,7 +1078,6 @@ def load_json(path, default):
 
 
 def atomic_save_json(path, data, max_bytes=None):
-    """Atomically persist JSON; reject oversized state before replacing old state."""
     tmp = path.with_suffix(path.suffix + ".new")
     try:
         with tmp.open("w", encoding="utf-8") as f:
@@ -1026,17 +1099,14 @@ def atomic_save_json(path, data, max_bytes=None):
 
 
 def canonical_url(raw):
-    """Normalize host/scheme and fragment without altering functional query parameters."""
     raw = (raw or "").strip()
     p = urlparse(raw)
     if not p.scheme or not p.netloc:
         return raw
-    # Keep original query order: some signed/download URLs may be order-sensitive.
     return urlunparse((p.scheme.lower(), p.netloc.lower(), p.path or "/", "", p.query, ""))
 
 
 def canonical_identity_url(raw):
-    """Deduplication key: remove common trackers and language selectors only for identity."""
     normalized = canonical_url(raw)
     p = urlparse(normalized)
     if not p.scheme or not p.netloc:
@@ -1245,9 +1315,6 @@ def load_state():
         record.setdefault("pdf_hash", None)
         record.setdefault("pdf_hash_kind", None)
         record.setdefault("last_content_check_at", None)
-        # Migration: older state files have no independent content-check clock.
-        # Use the last observation timestamp once, so legacy PDFs are not all
-        # downloaded on the very first run after this upgrade.
         if not record.get("last_content_check_at"):
             record["last_content_check_at"] = (
                 record.get("last_seen") or record.get("first_seen") or utc_now()
@@ -1289,7 +1356,6 @@ def mark_site_failure(state, site_id, error):
 
 
 def _check_and_send_site_alerts(state, cfg, token, chat_id, threshold=3, cooldown_hours=6):
-    """Send consolidated failure/recovery alerts; state changes only after delivery."""
     now = datetime.now(timezone.utc)
     failing_candidates = []
     recovered_candidates = []
@@ -1353,7 +1419,6 @@ def local_score(title, url, context, keywords):
 
 
 def pending_priority(record, keywords, now=None):
-    """Score important items while aging older pending items to prevent starvation."""
     now = now or datetime.now(timezone.utc)
     first_seen = _parse_utc_timestamp(record.get("first_seen"))
     age_days = max(0.0, (now - first_seen).total_seconds() / 86400) if first_seen else 0.0
@@ -1385,7 +1450,6 @@ def _url_path_segments(url):
 
 
 def build_site_index(state):
-    """Index all records by site; prefer non-permanent records for duplicate URLs."""
     index = {}
     permanent = {}
     for iid, record in state.get("items", {}).items():
@@ -1397,15 +1461,12 @@ def build_site_index(state):
         row = (iid, record.get("title", ""), record.get("url", ""))
         target = permanent if record.get("status") == "permanent_error" else index
         target.setdefault(sid, []).append(row)
-    # Keep permanent_error rows available for URL matching, but after regular
-    # rows so a sent/ignored record wins if historical duplicates exist.
     for sid, rows in permanent.items():
         index.setdefault(sid, []).extend(rows)
     return index
 
 
 def find_url_match(site_items, url):
-    """Find an existing record by canonical URL, even when its title changed."""
     target = canonical_identity_url(url)
     if not target:
         return None
@@ -1416,11 +1477,6 @@ def find_url_match(site_items, url):
 
 
 def find_fuzzy_match(site_items, title, url):
-    """Match likely duplicate representations, including HTML pages and linked PDFs.
-
-    Path overlap permits a slightly lower title threshold. With unrelated paths,
-    require a longer, near-identical title to avoid merging unrelated notices.
-    """
     if not site_items or not title:
         return None
     new_title = _normalize_title(title)
@@ -1436,8 +1492,6 @@ def find_fuzzy_match(site_items, title, url):
             continue
         existing_segs = _url_path_segments(existing_url)
         overlap = bool(new_segs and existing_segs and (new_segs & existing_segs))
-        # token_sort_ratio penalizes missing/distinctive words; token_set_ratio can
-        # return 100 for a title that is merely a subset of another notice title.
         score = fuzz.token_sort_ratio(new_title, existing_norm)
         threshold = FUZZY_DUPLICATE_THRESHOLD if overlap else FUZZY_CROSS_PATH_THRESHOLD
         if not overlap and min(len(new_title), len(existing_norm)) < 30:
@@ -1557,7 +1611,6 @@ def discover_from_sitemap(session, base_url, scan):
 
 
 def _robots_allowed(session, url, timeout):
-    """Respect a site's robots.txt when available; fail open only on fetch/parse errors."""
     parsed = urlparse(url)
     origin = f"{parsed.scheme}://{parsed.netloc}"
     if origin not in _ROBOTS_CACHE:
@@ -1582,7 +1635,6 @@ def _robots_allowed(session, url, timeout):
         return True
 
 def discover_site(session, site, scan):
-    """Discover bounded listing/archive/pagination/sitemap pages while respecting robots.txt."""
     base_url = site["url"]
     timeout = scan["request_timeout_seconds"]
     max_pages = scan["max_discovery_pages_per_site"]
@@ -1610,8 +1662,6 @@ def discover_site(session, site, scan):
             continue
 
         is_archive = _is_archive_url(page)
-        # Reject over-budget URLs before adding them to visited; otherwise a long
-        # queue of skipped archive links can consume the total crawl budget.
         if is_archive and archive_visited_count >= max_archive_pages:
             continue
         if not is_archive and normal_visited_count >= max_pages:
@@ -1637,8 +1687,6 @@ def discover_site(session, site, scan):
             if not _robots_allowed(session, page, timeout):
                 print(f"[ROBOTS-SKIP] {page}", file=sys.stderr)
                 continue
-            # Per-site requests are sequential; a small inter-request delay avoids
-            # hammering a single district domain while 24 sites are scanned in parallel.
             domain_delay = float(scan.get("domain_delay_seconds", 1.0) or 0.0)
             if domain_delay > 0 and visited:
                 time.sleep(min(domain_delay, 10.0))
@@ -1764,7 +1812,7 @@ def _extract_pdf_text_rapidocr(content):
 
 def _extract_with_gemini_pdf(pdf_bytes):
     global _GEMINI_QUOTA_EXHAUSTED
-    if not GEMINI_PDF_OCR_ENABLED or not _GEMINI_API_KEY:
+    if not GEMINI_PDF_OCR_ENABLED or not _GEMINI_KEYS_POOL:
         return ""
     if _GEMINI_QUOTA_EXHAUSTED:
         return ""
@@ -1779,64 +1827,54 @@ def _extract_with_gemini_pdf(pdf_bytes):
             "Return extracted text verbatim, preserving structure. "
             "Do NOT summarize. Do NOT invent. Just extract the text."
         )
-        payload = {
-            "contents": [{"parts": [
-                {"text": prompt},
-                {"inline_data": {"mime_type": "application/pdf", "data": pdf_b64}}
-            ]}],
-            "generationConfig": {"temperature": 0.0, "maxOutputTokens": 16384},
-        }
-        headers = {"x-goog-api-key": _GEMINI_API_KEY, "Content-Type": "application/json"}
+        payload = {"contents": [{"parts": [
+            {"text": prompt},
+            {"inline_data": {"mime_type": "application/pdf", "data": pdf_b64}}
+        ]}], "generationConfig": {"temperature": 0.0, "maxOutputTokens": 16384}}
         for model in _DYNAMIC_MODELS:
             if model in _DEAD_MODELS:
                 continue
             endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
             for attempt in range(2):
+                response, key_used, reason = _gemini_post_with_rotation(endpoint, payload, timeout=90)
+                if response is None:
+                    if reason == "all_keys_quota_exhausted":
+                        _GEMINI_QUOTA_EXHAUSTED = True
+                        print("[QUOTA] All configured Gemini keys exhausted for this run; using local OCR fallback.", file=sys.stderr)
+                    elif reason == "rate_limited":
+                        print("[WARN] Gemini keys are temporarily rate-limited; using local OCR fallback for this PDF.", file=sys.stderr)
+                    else:
+                        print(f"[WARN] Gemini request unavailable ({reason}); using local OCR fallback for this PDF.", file=sys.stderr)
+                    return ""
+                if response.status_code == 404:
+                    _DEAD_MODELS.add(model)
+                    print(f"[WARN] Gemini model unavailable ({model}); trying next model.", file=sys.stderr)
+                    break
+                if response.status_code >= 500:
+                    print(f"[WARN] Gemini server HTTP {response.status_code} ({model}), attempt {attempt+1}/2", file=sys.stderr)
+                    if attempt == 0:
+                        time.sleep(1.5)
+                        continue
+                    break
+                if response.status_code >= 400:
+                    print(f"[WARN] Gemini HTTP {response.status_code} ({model}): {response.text[:150]}", file=sys.stderr)
+                    break
                 try:
-                    response = requests.post(endpoint, headers=headers, json=payload, timeout=90)
-                    if response.status_code == 429:
-                        try:
-                            err_data = response.json()
-                            err_msg = str(err_data.get("error", {}).get("message", ""))
-                        except Exception:
-                            err_msg = response.text
-                        if "quota" in err_msg.lower() or "exceeded" in err_msg.lower():
-                            _GEMINI_QUOTA_EXHAUSTED = True
-                            print("[QUOTA] Gemini quota exhausted — switching to RapidOCR", file=sys.stderr)
-                            return ""
-                        else:
-                            print(f"[WARN] Gemini 429 short-limit ({model})", file=sys.stderr)
-                            time.sleep(10)
-                            continue
-                    if response.status_code == 404:
-                        _DEAD_MODELS.add(model)
-                        print(f"[WARN] Gemini model DEAD ({model})", file=sys.stderr)
-                        break
-                    if response.status_code >= 400:
-                        print(f"[WARN] Gemini {response.status_code} ({model}): {response.text[:150]}", file=sys.stderr)
-                        break
                     data = response.json()
-                    text = _extract_gemini_text(data)
-                    if text and len(text.strip()) > 50:
-                        print(f"[INFO] Gemini PDF OCR succeeded ({model}, attempt {attempt+1})", file=sys.stderr)
-                        return text
-                    finish_reason = "unknown"
-                    try:
-                        cands = data.get("candidates") or []
-                        if cands:
-                            finish_reason = cands[0].get("finishReason", "unknown")
-                    except Exception:
-                        pass
+                    extracted = _extract_gemini_text(data)
+                    if extracted and len(extracted.strip()) > 50:
+                        key_index = _GEMINI_KEYS_POOL.index(key_used) + 1 if key_used in _GEMINI_KEYS_POOL else "?"
+                        print(f"[INFO] Gemini PDF OCR succeeded ({model}, key #{key_index})", file=sys.stderr)
+                        return extracted
+                    candidates = data.get("candidates") or []
+                    finish_reason = candidates[0].get("finishReason", "unknown") if candidates else "unknown"
                     print(f"[WARN] Gemini empty ({model}), finishReason={finish_reason}", file=sys.stderr)
                     break
-                except requests.Timeout:
-                    print(f"[WARN] Gemini timeout ({model}), attempt {attempt+1}/2", file=sys.stderr)
-                    continue
                 except Exception as exc:
-                    print(f"[WARN] Gemini error ({model}): {exc}", file=sys.stderr)
+                    print(f"[WARN] Gemini response parse failed ({model}): {type(exc).__name__}", file=sys.stderr)
                     break
     except Exception as exc:
-        print(f"[WARN] Gemini PDF OCR failed: {exc}", file=sys.stderr)
+        print(f"[WARN] Gemini PDF OCR failed: {type(exc).__name__}", file=sys.stderr)
     return ""
 
 
@@ -2424,12 +2462,15 @@ def gemini_classify(items, api_key, model, timeout):
             "temperature": 0.1,
         },
     }
-    headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
     last_error = "Gemini classification failed"
     for attempt in range(3):
         try:
-            response = requests.post(endpoint, headers=headers, json=payload, timeout=timeout)
-            if response.status_code in (429, 500, 502, 503, 504):
+            response, key_used, reason = _gemini_post_with_rotation(endpoint, payload, timeout=timeout)
+            if response is None:
+                if reason == "all_keys_quota_exhausted":
+                    raise RuntimeError("All Gemini keys quota-exhausted")
+                raise RuntimeError(f"Gemini keys unavailable: {reason}")
+            if response.status_code in (500, 502, 503, 504):
                 last_error = f"Gemini HTTP {response.status_code}"
                 if attempt < 2:
                     time.sleep(min(10, 2 ** attempt))
@@ -2437,14 +2478,14 @@ def gemini_classify(items, api_key, model, timeout):
                 raise RuntimeError(last_error)
             if response.status_code == 404:
                 _DEAD_MODELS.add(model)
-                raise RuntimeError(f"Gemini model DEAD: {model}")
+                raise RuntimeError(f"Gemini model unavailable: {model}")
             if response.status_code >= 400:
                 raise RuntimeError(f"Gemini HTTP {response.status_code}: {clean_text(response.text, 500)}")
             data = response.json()
-            text = _extract_gemini_text(data)
-            if not text:
+            response_text = _extract_gemini_text(data)
+            if not response_text:
                 raise RuntimeError("Gemini returned empty response")
-            return _parse_gemini_response(text, len(items))
+            return _parse_gemini_response(response_text, len(items))
         except (requests.RequestException, ValueError, KeyError, TypeError, RuntimeError) as exc:
             last_error = str(exc)
             if attempt < 2:
@@ -2453,9 +2494,9 @@ def gemini_classify(items, api_key, model, timeout):
 
 
 def gemini_classify_with_fallback(items, api_key, timeout):
-    global _GEMINI_QUOTA_EXHAUSTED
-    if _GEMINI_QUOTA_EXHAUSTED:
-        print("[QUOTA] Gemini quota exhausted — using keyword fallback", file=sys.stderr)
+    global _GEMINI_QUOTA_EXHAUSTED, _GEMINI_KEY_INDEX
+    if _GEMINI_QUOTA_EXHAUSTED or not _has_live_gemini_keys():
+        print("[GEMINI] No usable Gemini keys; using keyword fallback.", file=sys.stderr)
         return keyword_fallback(items)
     seen = []
     for model in _DYNAMIC_MODELS:
@@ -2469,13 +2510,13 @@ def gemini_classify_with_fallback(items, api_key, timeout):
                 return result
         except Exception as exc:
             err_str = str(exc)
-            if "quota" in err_str.lower() or "RESOURCE_EXHAUSTED" in err_str:
+            if "all gemini keys quota-exhausted" in err_str.lower():
                 _GEMINI_QUOTA_EXHAUSTED = True
-                print("[QUOTA] Gemini quota exhausted mid-classify", file=sys.stderr)
+                print("[QUOTA] All Gemini keys quota-exhausted; using keyword fallback.", file=sys.stderr)
                 break
             print(f"[WARN] Classify {model} failed: {clean_text(err_str, 200)}", file=sys.stderr)
             continue
-    print("[WARN] All Gemini models failed. Using keyword fallback.", file=sys.stderr)
+    print("[WARN] Gemini classification unavailable. Using keyword fallback.", file=sys.stderr)
     return keyword_fallback(items)
 
 
@@ -3316,7 +3357,6 @@ def truncate_telegram(text, limit=TELEGRAM_SAFE_LIMIT):
 # ---------------------------------------------------------------------------
 
 def prune_state(state, retention_days, max_items=3000, max_pending_attempts=72, max_bytes=3000000):
-    """Keep state bounded and useful for deduplication without retaining full AI/PDF payloads."""
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=retention_days)
     items = state.setdefault("items", {})
@@ -3330,7 +3370,6 @@ def prune_state(state, retention_days, max_items=3000, max_pending_attempts=72, 
 
         status = record.get("status", "baseline")
         loaded_status = record.pop("_loaded_status", None)
-        # Avoid records that remain pending forever after their retry budget is exhausted.
         if status == "pending" and int(record.get("attempts", 0) or 0) >= max_pending_attempts:
             record["status"] = "permanent_error"
             record["last_error"] = clean_text(
@@ -3359,17 +3398,13 @@ def prune_state(state, retention_days, max_items=3000, max_pending_attempts=72, 
             status = "permanent_error"
 
         if status in terminal:
-            # Status-specific retention: baseline records are shorter-lived than sent records.
             status_days = {"sent": 90, "ignored": 30, "baseline": 60, "permanent_error": retention_days}.get(status, retention_days)
             status_cutoff = now - timedelta(days=status_days)
-            # Existing state migration: use first_seen once, not last_seen (which refreshes
-            # every crawl and otherwise makes old records immortal).
             if not record.get("terminal_at"):
                 if loaded_status and loaded_status not in terminal:
                     record["terminal_at"] = now.isoformat()
                 else:
                     record["terminal_at"] = record.get("first_seen") or record.get("last_seen") or now.isoformat()
-            # Terminal records need only small metadata for deduplication and PDF change checks.
             record.pop("pdf_text", None)
             record.pop("classification", None)
             record.pop("summary", None)
@@ -3388,13 +3423,11 @@ def prune_state(state, retention_days, max_items=3000, max_pending_attempts=72, 
             if dt < status_cutoff:
                 remove.append(key)
         else:
-            # A re-opened/changed item is active again; don't carry a terminal timestamp.
             record.pop("terminal_at", None)
 
     for key in remove:
         items.pop(key, None)
 
-    # Review items are useful operationally but must not grow without bound.
     review = state.setdefault("review_queue", {})
     review_cutoff = now - timedelta(days=90)
     for key, entry in list(review.items()):
@@ -3407,7 +3440,6 @@ def prune_state(state, retention_days, max_items=3000, max_pending_attempts=72, 
             if review.get(key, {}).get("status") != "open":
                 review.pop(key, None)
 
-    # Hard item-count ceiling is a backstop in addition to age-based retention.
     if len(items) > max_items:
         terminal_rows = []
         active_rows = []
@@ -3422,8 +3454,6 @@ def prune_state(state, retention_days, max_items=3000, max_pending_attempts=72, 
         while len(items) > max_items and terminal_rows:
             _, key = terminal_rows.pop(0)
             items.pop(key, None)
-        # Exceptional overload only: keep newest active records, but report any active
-        # records that must be evicted so the state file remains bounded.
         if len(items) > max_items:
             active_rows.sort(reverse=True)
             keep = {key for _, key in active_rows[:max_items - len(items) + len(active_rows)]}
@@ -3439,8 +3469,6 @@ def prune_state(state, retention_days, max_items=3000, max_pending_attempts=72, 
                     items.pop(key, None)
             print("[WARN] State hard cap reached; oldest excess records were evicted.", file=sys.stderr)
 
-    # Bound serialized bytes as well as item count. This is important because a
-    # few unusually large active classifications can otherwise make Git state grow.
     def serialized_size():
         try:
             payload = json.dumps(state, ensure_ascii=False, indent=2, separators=(",", ": ")) + "\n"
@@ -3448,7 +3476,6 @@ def prune_state(state, retention_days, max_items=3000, max_pending_attempts=72, 
         except (TypeError, ValueError):
             return max_bytes + 1
 
-    # First compact fields that are not needed to resume work or format a Telegram message.
     for record in items.values():
         if not isinstance(record, dict):
             continue
@@ -3474,7 +3501,6 @@ def prune_state(state, retention_days, max_items=3000, max_pending_attempts=72, 
             compact.setdefault("category", classification.get("category", "notice"))
             record["classification"] = compact
 
-    # Drop the oldest terminal/dedup-only records until the byte budget is met.
     if serialized_size() > max_bytes:
         terminal_rows = []
         for key, record in items.items():
@@ -3486,14 +3512,9 @@ def prune_state(state, retention_days, max_items=3000, max_pending_attempts=72, 
         for _, key in terminal_rows:
             items.pop(key, None)
             removed_terminal += 1
-            # Re-serialize in batches; checking after every deletion is quadratic
-            # and can slow down a large recovery/backlog run.
             if removed_terminal % 20 == 0 and serialized_size() <= max_bytes:
                 break
 
-    # Last-resort compaction preserves unsent ready notices first. Pending records
-    # keep enough extracted text for a retry, while already-classified ready records
-    # no longer need the full PDF text persisted.
     if serialized_size() > max_bytes:
         for record in items.values():
             if not isinstance(record, dict):
@@ -3506,8 +3527,6 @@ def prune_state(state, retention_days, max_items=3000, max_pending_attempts=72, 
             if isinstance(record.get("context"), str):
                 record["context"] = clean_text(record["context"], 350)
         if serialized_size() > max_bytes:
-            # Rare overload: preserve newest ready/pending records; evict oldest
-            # records only when retaining all of them would violate the hard cap.
             active = []
             for key, record in items.items():
                 if not isinstance(record, dict):
@@ -3517,7 +3536,6 @@ def prune_state(state, retention_days, max_items=3000, max_pending_attempts=72, 
                 priority = 2 if status == "ready" else 1 if status == "pending" else 0
                 stamp = str(record.get("first_seen") or record.get("last_seen") or "")
                 active.append((priority, stamp, key))
-            # Evict low-priority records first, then oldest within each priority.
             active.sort(key=lambda row: (row[0], row[1]))
             evicted = 0
             for _, _, key in active:
@@ -3530,8 +3548,6 @@ def prune_state(state, retention_days, max_items=3000, max_pending_attempts=72, 
 
     final_size = serialized_size()
     if final_size > max_bytes:
-        # Do not write an oversized state silently. The caller logs the measured size;
-        # this should only occur if the state envelope itself is larger than the cap.
         raise RuntimeError(f"State exceeds configured byte cap: {final_size} > {max_bytes}")
     print(f"[STATE] bounded state size={final_size} bytes (limit={max_bytes})")
 
@@ -3646,7 +3662,6 @@ def _parse_upload_date(raw):
 
 
 def suppress_stale_pending_and_ready(state):
-    """Prevent stale persisted work items from bypassing the candidate date gate."""
     changed = 0
     for record in state.get("items", {}).values():
         if not isinstance(record, dict) or record.get("status") not in {"pending", "ready"}:
@@ -3667,7 +3682,6 @@ def suppress_stale_pending_and_ready(state):
 
 
 def enqueue_persisted_pending(state, pending, max_pending_attempts, configured_site_ids):
-    """Requeue persisted pending records even when a current site scan misses them."""
     by_id = {iid: record for iid, record in pending}
     for iid, record in state.get("items", {}).items():
         if not isinstance(record, dict) or record.get("status") != "pending":
@@ -3685,10 +3699,16 @@ def enqueue_persisted_pending(state, pending, max_pending_attempts, configured_s
 
 def main():
     global STALE_NOTICE_DAYS, _RUNTIME_PDF_CACHE, _GEMINI_API_KEY, _GEMINI_QUOTA_EXHAUSTED
+    global _GEMINI_KEYS_POOL, _GEMINI_KEY_INDEX, _GEMINI_DEAD_KEYS, _MODELS_DISCOVERED, _DYNAMIC_MODELS
 
     _RUNTIME_PDF_CACHE = {}
     _DEAD_MODELS.clear()
     _GEMINI_QUOTA_EXHAUSTED = False
+    _GEMINI_KEYS_POOL = _load_gemini_keys()
+    _GEMINI_KEY_INDEX = 0
+    _GEMINI_DEAD_KEYS = set()
+    _MODELS_DISCOVERED = False
+    _DYNAMIC_MODELS = []
 
     import time as _time
     _START_TIME = _time.monotonic()
@@ -3708,11 +3728,15 @@ def main():
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
 
-    _GEMINI_API_KEY = gemini_key
+    _GEMINI_API_KEY = gemini_key or (_GEMINI_KEYS_POOL[0] if _GEMINI_KEYS_POOL else "")
 
-    if not token or not chat_id or not gemini_key:
-        print("[FATAL] TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID and GEMINI_API_KEY are required.", file=sys.stderr)
+    if not token or not chat_id:
+        print("[FATAL] TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are required.", file=sys.stderr)
         return 2
+    if not _GEMINI_KEYS_POOL:
+        print("[FATAL] No Gemini API keys configured. Set GEMINI_API_KEYS or GEMINI_API_KEY.", file=sys.stderr)
+        return 2
+    print(f"[INFO] Loaded {len(_GEMINI_KEYS_POOL)} unique Gemini API key(s).", file=sys.stderr)
     if not cfg["websites"]:
         print("[FATAL] No enabled websites configured.", file=sys.stderr)
         return 2
@@ -3758,7 +3782,6 @@ def main():
                 mark_site_failure(state, site["id"], str(exc))
                 print(f"[ERROR] {site['name']}: {exc}", file=sys.stderr)
 
-    # ⭐ NEW: Site alerts (after all sites done)
     try:
         threshold = scan.get("site_alert_threshold", 3)
         cooldown = scan.get("site_alert_cooldown_hours", 6)
@@ -3802,7 +3825,6 @@ def main():
         elif not ss["baseline_complete"]:
             ss["baseline_pending_reason"] = "scan failed or partial errors; baseline withheld to prevent archive spam"
             print(f"[BASELINE-PENDING] {site['name']}: waiting for a complete scan", file=sys.stderr)
-            # Do not classify or notify any candidates from an incomplete baseline scan.
             continue
 
         site_items_list = site_index.get(sid, [])
@@ -3812,9 +3834,6 @@ def main():
             record = state["items"].get(iid)
             upload_dt = _parse_upload_date(candidate.get("upload_date"))
 
-            # Apply the stale gate to EVERY discovered candidate, not only brand-new
-            # IDs. This prevents an old archive notice from being re-queued merely
-            # because its title/context changed or a prior pending record was restored.
             if _is_stale_notice(
                 candidate.get("title", ""), candidate.get("context", ""),
                 candidate.get("url", ""), upload_date=upload_dt,
@@ -3859,8 +3878,6 @@ def main():
             )
 
             if record is None:
-                # Prefer URL identity over title similarity: official notice pages often
-                # keep the same URL while the title/context changes after an update.
                 matched_iid = find_url_match(site_items_list, candidate["url"])
                 if not matched_iid:
                     matched_iid = find_fuzzy_match(site_items_list, candidate["title"], candidate["url"])
@@ -3942,8 +3959,6 @@ def main():
                 record["last_seen"] = utc_now()
 
                 if record.get("status") in ("sent", "ignored"):
-                    # last_seen changes on every scan, so it must not be used as the
-                    # validator-check clock. Track the last check independently.
                     should_check = True
                     try:
                         checked_at = record.get("last_content_check_at")
@@ -4012,14 +4027,9 @@ def main():
             ):
                 pending.append((iid, record))
 
-    # Old pending/ready items can survive in state even when no longer present in a
-    # site's current listing. Suppress them before restoring the persisted queue.
     suppress_stale_pending_and_ready(state)
     pending = [(iid, record) for iid, record in pending if record.get("status") == "pending"]
 
-    # Sweep ALL persisted pending records, not only candidates visible in this scan.
-    # This prevents fresh pending notices getting stranded when a district site is down
-    # or a listing page changes before the next successful run.
     pending = enqueue_persisted_pending(
         state,
         pending,
@@ -4031,7 +4041,6 @@ def main():
         site_state(state, site["id"])["baseline_complete"] for site in cfg["websites"]
     )
 
-    # One record may be discovered through multiple archive pages. Classify it once/run.
     pending = list({iid: record for iid, record in pending}.items())
     pending.sort(
         key=lambda pair: pending_priority(pair[1], scan["keywords"]),
@@ -4059,8 +4068,6 @@ def main():
                 [record for _, record in batch], gemini_key, scan["request_timeout_seconds"],
             )
             for index, (_, record) in enumerate(batch):
-                # _fetch_pdfs_for_batch may have conclusively marked a PDF stale.
-                # Do not let Gemini overwrite that decision later in this run.
                 if record.get("status") == "baseline" and str(record.get("last_error", "")).startswith("PDF content stale"):
                     continue
                 record["attempts"] = int(record.get("attempts", 0)) + 1
@@ -4145,8 +4152,6 @@ def main():
             )
 
     try:
-        # No new notice for a day is normal on district sites. Alert only when this
-        # run actually had errors, and rate-limit the alert to avoid notification fatigue.
         should_alert = run_errors > 0
         last_health_alert = state.get("last_health_alert_at")
         if last_health_alert:
@@ -4190,8 +4195,6 @@ def main():
             pass
     except Exception as exc:
         state.setdefault("metrics", {})["state_save_failures"] = int(state.get("metrics", {}).get("state_save_failures", 0)) + 1
-        # A failed save must fail the process. Never retry an unchecked save here:
-        # it could overwrite the last known-good state with an oversized/broken file.
         print(f"[FATAL] State save failed: {exc}", file=sys.stderr)
         return 1
 
