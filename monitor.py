@@ -136,20 +136,34 @@ def _cache_put(url, content):
 
 
 def _load_gemini_keys():
+    """
+    Load unique Gemini keys from any of the supported env vars.
+
+    IMPORTANT: Every source is comma-split, so the user can paste multiple
+    keys into EITHER GEMINI_API_KEYS (recommended) OR GEMINI_API_KEY (legacy)
+    using the form:  key1,key2,key3
+    Duplicate keys are ignored while preserving order.
+    """
     keys = []
     seen = set()
 
     def add(raw):
-        key = (raw or "").strip()
-        if key and key not in seen:
-            seen.add(key)
-            keys.append(key)
+        for part in (raw or "").split(","):
+            key = part.strip()
+            if key and key not in seen:
+                seen.add(key)
+                keys.append(key)
 
-    for part in os.getenv("GEMINI_API_KEYS", "").split(","):
-        add(part)
+    # Primary source (recommended): comma-separated list.
+    add(os.getenv("GEMINI_API_KEYS", ""))
+
+    # Optional numbered secrets: GEMINI_API_KEY_1 .. GEMINI_API_KEY_10
     for i in range(1, 11):
         add(os.getenv(f"GEMINI_API_KEY_{i}", ""))
+
+    # Legacy single-key env var. Also comma-split for convenience.
     add(os.getenv("GEMINI_API_KEY", ""))
+
     return keys
 
 
