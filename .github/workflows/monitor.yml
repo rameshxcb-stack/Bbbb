@@ -1,4 +1,3 @@
-
 name: Jharkhand District Notification Monitor
 
 on:
@@ -15,49 +14,20 @@ concurrency:
 
 jobs:
   monitor:
-    name: Scan Jharkhand District Notices
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
     steps:
-      - name: Checkout repository
+      - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-          persist-credentials: true
-
-      - name: Load persistent monitor state
-        id: load_state
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if git ls-remote --exit-code --heads origin monitor-state >/dev/null 2>&1; then
-            git fetch --no-tags origin monitor-state
-            git show FETCH_HEAD:state.json > state.json
-            test -s state.json
-            python -m json.tool state.json >/dev/null
-            echo "Loaded existing state from monitor-state branch."
-          else
-            echo "monitor-state branch not found; checking repository state.json."
-
-            if [ -f state.json ] && [ -s state.json ]; then
-              python -m json.tool state.json >/dev/null
-              echo "Using existing repository state.json."
-            else
-              echo "No previous state file found. Monitor will initialize it."
-            fi
-          fi
+          fetch-depth: 1
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Install system dependencies for PDF OCR
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y tesseract-ocr tesseract-ocr-hin poppler-utils
+          cache: "pip"
 
       - name: Install Python dependencies
         run: |
@@ -66,86 +36,75 @@ jobs:
 
       - name: Run regression tests
         run: |
-          if [ -d tests ]; then
-            python -m unittest discover -s tests -v
+          set -euo pipefail
+          python -m unittest discover -s tests -v
+
+      - name: Restore persisted state
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git fetch origin refs/heads/monitor-state:refs/remotes/origin/monitor-state 2>/dev/null; then
+            if git cat-file -e origin/monitor-state:state.json 2>/dev/null; then
+              git show origin/monitor-state:state.json > state.json
+              echo "Restored state.json from monitor-state branch."
+            else
+              echo "monitor-state branch exists but has no state.json; keeping repository default if present."
+            fi
           else
-            echo "No tests directory found; skipping regression tests."
+            echo "monitor-state branch not found; starting from state.json in the code repository, if present."
           fi
 
       - name: Run notification monitor
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-
           NOTIFY_LANGUAGE: "both"
           OCR_ENABLED: "true"
-          OCR_LANG: "eng+hin"
           OCR_DPI: "150"
-          OCR_MAX_WORKERS: "1"
-
+          OCR_MAX_WORKERS: "2"
           SEND_PDF_ENABLED: "true"
           GEMINI_MAX_OUTPUT_TOKENS: "16384"
           GEMINI_PDF_OCR_ENABLED: "true"
-          STALE_NOTICE_DAYS: "10"
         run: |
           python monitor.py
 
-      - name: Validate state file
-        if: ${{ always() && steps.load_state.outcome == 'success' }}
+      - name: Save state to monitor-state branch
+        if: always()
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-
-          if [ ! -s state.json ]; then
-            echo "::error::state.json is missing or empty."
-            exit 1
+          if [ ! -f state.json ]; then
+            echo "No state.json was produced or present; nothing to save."
+            exit 0
           fi
 
-          python -m json.tool state.json >/dev/null
+          cp state.json /tmp/monitor-state.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          state_bytes=$(wc -c < state.json | tr -d ' ')
-          if [ "$state_bytes" -gt 3100000 ]; then
-            echo "::error::state.json exceeds the 3.1 MB safety limit."
-            exit 1
-          fi
-
-          echo "State file validated: ${state_bytes} bytes."
-
-      - name: Persist state to monitor-state branch
-        if: ${{ always() && steps.load_state.outcome == 'success' && hashFiles('state.json') != '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python -m json.tool state.json >/dev/null
-          cp state.json /tmp/jharkhand-monitor-state.json
-
-          git switch --orphan state-update
-          git rm -rf . >/dev/null 2>&1 || true
-
-          cp /tmp/jharkhand-monitor-state.json state.json
-          python -m json.tool state.json >/dev/null
-
-          git add state.json
-          git -c user.name="github-actions[bot]" \
-              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-              commit -m "Update monitor state"
-
-          pushed=false
-
-          for i in 1 2 3 4 5; do
-            if git push origin HEAD:monitor-state; then
-              pushed=true
-              echo "State persisted successfully."
-              break
+          git fetch origin refs/heads/monitor-state:refs/remotes/origin/monitor-state 2>/dev/null || true
+          if git show-ref --verify --quiet refs/remotes/origin/monitor-state; then
+            git worktree add --detach /tmp/monitor-state-worktree origin/monitor-state
+            cp /tmp/monitor-state.json /tmp/monitor-state-worktree/state.json
+            cd /tmp/monitor-state-worktree
+            git add state.json
+            if git diff --cached --quiet; then
+              echo "State unchanged; no commit needed."
+              exit 0
             fi
-
-            echo "State push attempt $i failed; retrying in 5 seconds."
-            sleep 5
-          done
-
-          if [ "$pushed" != "true" ]; then
-            echo "::error::Could not persist monitor state after 5 attempts."
-            exit 1
+            git commit -m "chore: update notification state"
+          else
+            git worktree add --detach /tmp/monitor-state-worktree HEAD
+            cd /tmp/monitor-state-worktree
+            git switch --orphan monitor-state
+            git rm -rf . >/dev/null 2>&1 || true
+            cp /tmp/monitor-state.json state.json
+            git add state.json
+            git commit -m "chore: initialize notification state"
           fi
+
+          git push origin HEAD:refs/heads/monitor-state
