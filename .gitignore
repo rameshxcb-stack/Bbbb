@@ -1,0 +1,5 @@
+# Runtime state is stored on the dedicated monitor-state branch after migration.
+state.json
+state.json.tmp
+__pycache__/
+*.py[cod]
