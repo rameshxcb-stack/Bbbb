@@ -14,6 +14,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse, urlunparse, unquote, parse_qsl, urlencode
+from urllib.robotparser import RobotFileParser
 
 import pdfplumber
 import requests
@@ -47,10 +48,7 @@ FALLBACK_MODELS = [
 
 # Conservative title matching: URLs/paths still carry weight, but HTML/PDF
 # representations of the same notice can live at completely different paths.
-# Raised to 96 so distinct-but-similar titles (e.g. "... 2026" vs "... 2027")
-# are not merged. A dedicated digits-only guard in find_fuzzy_match handles
-# the remaining year/serial cases regardless of fuzzy ratio.
-FUZZY_DUPLICATE_THRESHOLD = 96
+FUZZY_DUPLICATE_THRESHOLD = 94
 FUZZY_CROSS_PATH_THRESHOLD = 96
 TELEGRAM_MAX_ATTEMPTS = 100
 TELEGRAM_RETRY_WINDOW_HOURS = 72
@@ -109,6 +107,7 @@ _DEAD_MODELS: set = set()
 _GEMINI_QUOTA_EXHAUSTED: bool = False
 
 _RAPIDOCR_INSTANCE = None
+_ROBOTS_CACHE = {}
 
 
 def _get_rapidocr():
@@ -257,7 +256,11 @@ def _schedule_telegram_retry(record, now=None):
 
 
 def _meaningful_metadata_change(old_title, new_title, old_context, new_context):
-    """Ignore whitespace/punctuation/short snippet churn, but reprocess substantive edits."""
+    """Ignore cosmetic churn; detect substantive text and critical-field changes."""
+    details = meaningful_change_details("\n".join([old_title or "", old_context or ""]),
+                                        "\n".join([new_title or "", new_context or ""]))
+    if details:
+        return True
     old_t = re.sub(r"[^\w]+", " ", (old_title or "").casefold()).strip()
     new_t = re.sub(r"[^\w]+", " ", (new_title or "").casefold()).strip()
     if old_t and new_t and old_t != new_t:
@@ -274,6 +277,67 @@ def _meaningful_metadata_change(old_title, new_title, old_context, new_context):
         if distance >= 30 and ratio < 78:
             return True
     return False
+
+
+MEANINGFUL_FIELDS = {
+    "application_deadline": [r"(?:last date|last date to apply|apply(?:ing)? till|closing date|अंतिम तिथि|आवेदन की अंतिम तिथि)\s*[:：-]?\s*([^\n,;]{1,50})"],
+    "exam_date": [r"(?:exam(?:ination)? date| परीक्षा तिथि|परीक्षा दिनांक)\s*[:：-]?\s*([^\n,;]{1,50})"],
+    "result_date": [r"(?:result date|परिणाम तिथि|रिजल्ट जारी)\s*[:：-]?\s*([^\n,;]{1,50})"],
+    "vacancy_count": [r"(?:total vacancies?|no\. of vacancies?|vacancies|पदों की संख्या|कुल पद|रिक्त पद)\s*[:：-]?\s*([\d,]+)"],
+    "age_limit": [r"(?:age limit|आयु सीमा)\s*[:：-]?\s*([^\n,;]{1,70})"],
+    "eligibility": [r"(?:eligibility|educational qualification|योग्यता|शैक्षणिक योग्यता)\s*[:：-]?\s*([^\n;]{1,120})"],
+    "corrigendum_number": [r"(?:corrigendum|amendment|शुद्धिपत्र|संशोधन)\s*(?:no\.?|number|संख्या)?\s*[:#-]?\s*([A-Z0-9/-]{1,30})"],
+}
+
+def extract_meaningful_fields(text):
+    """Extract comparable high-value notice fields without trusting raw file hashes."""
+    source = clean_text(text or "", 12000).casefold()
+    found = {}
+    for field, patterns in MEANINGFUL_FIELDS.items():
+        for pattern in patterns:
+            match = re.search(pattern, source, flags=re.I)
+            if match:
+                value = re.sub(r"\s+", " ", match.group(1)).strip(" .:-")
+                if value:
+                    found[field] = value
+                    break
+    return found
+
+def meaningful_change_details(old_text, new_text):
+    old_fields = extract_meaningful_fields(old_text)
+    new_fields = extract_meaningful_fields(new_text)
+    changed = {k: {"old": old_fields.get(k), "new": new_fields.get(k)}
+               for k in set(old_fields) | set(new_fields)
+               if old_fields.get(k) != new_fields.get(k)}
+    # Raw title/context comparison remains a fallback when field extraction is sparse.
+    if not changed:
+        old_norm = re.sub(r"\s+", " ", (old_text or "").casefold()).strip()
+        new_norm = re.sub(r"\s+", " ", (new_text or "").casefold()).strip()
+        if old_norm and new_norm and old_norm != new_norm:
+            ratio = fuzz.ratio(old_norm[:2000], new_norm[:2000])
+            if ratio < 78 and Levenshtein.distance(old_norm[:2000], new_norm[:2000]) >= 30:
+                changed["substantive_text"] = {"old": old_norm[:160], "new": new_norm[:160]}
+    return changed
+
+def baseline_can_complete(scan_success, errors):
+    """A baseline is complete only after a successful scan with no partial errors."""
+    return bool(scan_success) and not bool(errors)
+
+def add_review_item(state, record, reason, details=None):
+    """Persist ambiguous/failed records for manual audit instead of silently dropping them."""
+    queue = state.setdefault("review_queue", {})
+    key = hashlib.sha256((record.get("site_id", "") + "|" + record.get("url", "")).encode("utf-8")).hexdigest()
+    previous = queue.get(key, {})
+    queue[key] = {
+        "site_id": record.get("site_id"), "site_name": record.get("site_name"),
+        "url": record.get("url"), "title": record.get("title"),
+        "reason": clean_text(str(reason), 500),
+        "detected_dates": extract_meaningful_fields("\n".join([record.get("title", ""), record.get("context", ""), record.get("pdf_text", "")])) ,
+        "gemini_output": record.get("classification"),
+        "diff_summary": details or record.get("meaningful_diff", {}),
+        "status": "open", "retry_count": int(previous.get("retry_count", 0)) + (1 if previous else 0),
+        "first_seen": previous.get("first_seen", utc_now()), "updated_at": utc_now(),
+    }
 
 
 def _check_url_changed(session, url, record):
@@ -856,34 +920,64 @@ def _extract_upload_date(anchor_tag):
 
 
 def _is_stale_notice(title, context, url, upload_date=None, pdf_text=None):
+    """Reject old notices using publication dates, not unrelated exam/deadline dates.
+
+    Priority: explicit issue/publication date in the notice, then listing upload date.
+    If neither exists, an old-only year hint in title/context/URL is a conservative
+    fallback. A current-year hint (e.g. "2023 batch revised 2026") keeps a possible
+    current update eligible for processing.
+    """
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=STALE_NOTICE_DAYS)
+    title_text = str(title or "")
+    context_text = str(context or "")
+    url_text = str(url or "")
+    haystack = f"{title_text} {context_text} {url_text}".strip()
+    full_text = f"{haystack} {pdf_text or ''}".strip()
 
-    candidate_dates = []
+    # Strong archive-title gate: a clearly historical year/range in the actual
+    # candidate title must not be overridden by the current year in a site's
+    # generic footer, navigation, or broad scraped context. Only explicit evidence
+    # of a current-year revision/update in the title or notice-specific context can
+    # keep such an archive item eligible.
+    title_years = [int(y) for y in re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", title_text)]
+    current_year = now.year
+    update_words = r"(?:updated|update|revised|revision|corrigendum|addendum|amended|modified|नया संशोधन|संशोधित|अद्यतन|शुद्धिपत्र)"
+    # A title is strong archive evidence when it has an explicit old-year range,
+    # or its only year is at least two years old. A recent listing timestamp can
+    # still validate a single previous-year batch title.
+    current_year_update = bool(re.search(
+        rf"(?:revised|revision|corrigendum|addendum|amended|modified|संशोधित|शुद्धिपत्र).{{0,50}}{current_year}|{current_year}.{{0,50}}(?:revised|revision|corrigendum|addendum|amended|modified|संशोधित|शुद्धिपत्र)",
+        f"{title_text} {context_text}", re.I
+    ))
+    title_has_old_range = len(title_years) >= 2 and max(title_years) < current_year
+    title_has_very_old_year = bool(title_years) and max(title_years) < current_year - 1
+    if (title_has_old_range or title_has_very_old_year) and not current_year_update:
+        return True
+
+    # Do not let a future application deadline or exam date hide an old publication
+    # date. Only dates explicitly labelled as publication/issue dates count here.
+    issue_dates = _extract_explicit_issue_dates(full_text)
+    past_issue_dates = [d for d in issue_dates if d <= now]
+    if past_issue_dates:
+        return max(past_issue_dates) < cutoff
+    if issue_dates:
+        # Only future explicit issue dates were found; do not classify as stale.
+        return False
 
     if upload_date is not None:
         if upload_date.tzinfo is None:
             upload_date = upload_date.replace(tzinfo=timezone.utc)
-        candidate_dates.append(upload_date)
+        else:
+            upload_date = upload_date.astimezone(timezone.utc)
+        return upload_date < cutoff
 
-    haystack = f"{title} {context} {url}".strip()
-    candidate_dates.extend(_extract_full_dates(haystack))
-
-    if pdf_text:
-        candidate_dates.extend(_extract_full_dates(pdf_text))
-
-    if not candidate_dates:
-        # A year appearing in a title/URL (e.g. "2023 batch revised in 2026") is
-        # not a reliable publication date. Without a full, parseable date, do not
-        # reject the notice based on a bare year; false negatives are worse here.
-        return False
-
-    past_dates = [d for d in candidate_dates if d <= now]
-    if not past_dates:
-        return False
-
-    latest = max(past_dates)
-    return latest < cutoff
+    # Fallback for archived entries with no publication metadata. Do not reject a
+    # mixed/updated notice such as "2023 batch revised in 2026".
+    years = [int(y) for y in re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", full_text)]
+    if years and max(years) < now.year:
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -911,7 +1005,7 @@ def load_json(path, default):
 
 def atomic_save_json(path, data, max_bytes=None):
     """Atomically persist JSON; reject oversized state before replacing old state."""
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = path.with_suffix(path.suffix + ".new")
     try:
         with tmp.open("w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -1015,13 +1109,16 @@ def get_config():
         "gemini_batch_size": 3,
         "gemini_max_calls_per_run": 15,
         "retention_days": 90,
+        "sent_retention_days": 90,
+        "ignored_retention_days": 30,
+        "baseline_retention_days": 60,
+        "domain_delay_seconds": 1.0,
         "max_state_items": 3000,
         "max_state_bytes": 3000000,
         "max_pending_attempts": 72,
         "stale_notice_days": 10,
         "site_alert_threshold": 3,
         "site_alert_cooldown_hours": 6,
-        "site_empty_scan_threshold_runs": 72,
         "keywords": [],
         "discovery_keywords": [],
         "sitemap_enabled": True,
@@ -1039,13 +1136,16 @@ def get_config():
     scan["gemini_batch_size"] = max(1, min(20, int(scan["gemini_batch_size"])))
     scan["gemini_max_calls_per_run"] = max(1, int(scan["gemini_max_calls_per_run"]))
     scan["retention_days"] = max(7, int(scan["retention_days"]))
+    scan["sent_retention_days"] = max(7, int(scan["sent_retention_days"]))
+    scan["ignored_retention_days"] = max(7, int(scan["ignored_retention_days"]))
+    scan["baseline_retention_days"] = max(7, int(scan["baseline_retention_days"]))
+    scan["domain_delay_seconds"] = max(0.0, min(10.0, float(scan["domain_delay_seconds"])))
     scan["max_state_items"] = max(500, min(10000, int(scan["max_state_items"])))
     scan["max_state_bytes"] = max(500000, min(3000000, int(scan["max_state_bytes"])))
     scan["max_pending_attempts"] = max(1, int(scan["max_pending_attempts"]))
     scan["stale_notice_days"] = max(1, int(scan["stale_notice_days"]))
     scan["site_alert_threshold"] = max(1, int(scan["site_alert_threshold"]))
     scan["site_alert_cooldown_hours"] = max(1, int(scan["site_alert_cooldown_hours"]))
-    scan["site_empty_scan_threshold_runs"] = max(6, int(scan["site_empty_scan_threshold_runs"]))
     scan["sitemap_enabled"] = bool(scan["sitemap_enabled"])
     scan["keywords"] = [clean_text(str(x), 80).lower() for x in scan.get("keywords", []) if str(x).strip()]
     scan["discovery_keywords"] = [clean_text(str(x), 80).lower() for x in scan.get("discovery_keywords", []) if str(x).strip()]
@@ -1089,6 +1189,10 @@ def default_state():
         "last_run": None,
         "items": {},
         "sites": {},
+        "review_queue": {},
+        "metrics": {"site_scan_success": {}, "site_scan_failure": {}, "parse_errors": 0,
+                     "sent_notifications": 0, "failed_notifications": 0,
+                     "duplicate_rejects": 0, "state_save_failures": 0},
         "stats": {"runs": 0, "sent": 0, "ignored": 0, "pending": 0, "errors": 0},
     }
 
@@ -1102,6 +1206,12 @@ def load_state():
     state.setdefault("last_run", None)
     state.setdefault("items", {})
     state.setdefault("sites", {})
+    state.setdefault("review_queue", {})
+    state.setdefault("metrics", {})
+    state["metrics"].setdefault("site_scan_success", {})
+    state["metrics"].setdefault("site_scan_failure", {})
+    for _metric in ("parse_errors", "sent_notifications", "failed_notifications", "duplicate_rejects", "state_save_failures"):
+        state["metrics"].setdefault(_metric, 0)
     state.setdefault("stats", {})
     for key in ("runs", "sent", "ignored", "pending", "errors"):
         state["stats"].setdefault(key, 0)
@@ -1142,7 +1252,7 @@ def load_state():
             record["last_content_check_at"] = (
                 record.get("last_seen") or record.get("first_seen") or utc_now()
             )
-    state["version"] = 28
+    state["version"] = 29
     return state
 
 
@@ -1158,12 +1268,6 @@ def site_state(state, site_id):
     s.setdefault("alert_active", False)
     s.setdefault("last_alert_at", None)
     s.setdefault("last_recovery_at", None)
-    # Silent-site detection: a site whose baseline is complete but whose scans
-    # keep returning 0 candidates. This is how an HTML structure change
-    # manifests — pages load fine but no notices are extracted.
-    s.setdefault("consecutive_empty_scans", 0)
-    s.setdefault("empty_alert_active", False)
-    s.setdefault("last_empty_alert_at", None)
     return s
 
 
@@ -1174,16 +1278,6 @@ def mark_site_success(state, site_id, count):
     s["last_error"] = None
     s["last_error_at"] = None
     s["last_item_count"] = count
-    # Only count empty scans after baseline is complete. A 0-candidate scan
-    # on the very first fetch is normal (a site may genuinely have no notices
-    # right now), but 0 candidates on a site that has previously yielded
-    # results for many consecutive runs strongly suggests the extractor no
-    # longer matches the site's HTML structure.
-    if s.get("baseline_complete"):
-        if count == 0:
-            s["consecutive_empty_scans"] = int(s.get("consecutive_empty_scans", 0)) + 1
-        else:
-            s["consecutive_empty_scans"] = 0
 
 
 def mark_site_failure(state, site_id, error):
@@ -1194,36 +1288,16 @@ def mark_site_failure(state, site_id, error):
     s["last_error_at"] = utc_now()
 
 
-def _check_and_send_site_alerts(
-    state, cfg, token, chat_id,
-    threshold=3,
-    cooldown_hours=6,
-    empty_scan_threshold=72,
-):
-    """Send consolidated failure/recovery/silent alerts; state changes only after delivery.
-
-    Three alert categories:
-
-    1. Failure alert — a site returned HTTP errors or network failures for
-       `threshold` consecutive runs.
-    2. Recovery alert — a previously failing site produced a successful scan.
-    3. Silent alert — a site with a completed baseline produced 0 candidates
-       for `empty_scan_threshold` consecutive successful runs. This is how an
-       HTML structure change manifests: pages still load but no notices are
-       extracted, so `consecutive_failures` stays at 0.
-    """
+def _check_and_send_site_alerts(state, cfg, token, chat_id, threshold=3, cooldown_hours=6):
+    """Send consolidated failure/recovery alerts; state changes only after delivery."""
     now = datetime.now(timezone.utc)
     failing_candidates = []
     recovered_candidates = []
-    empty_candidates = []
-    empty_recovered_candidates = []
 
     for site in cfg["websites"]:
         sid = site["id"]
         st = site_state(state, sid)
         failures = int(st.get("consecutive_failures", 0))
-
-        # ---- Failure / recovery ----
         if failures >= threshold and not st.get("alert_active", False):
             last_alert = st.get("last_alert_at")
             cooled = True
@@ -1240,28 +1314,6 @@ def _check_and_send_site_alerts(
         elif failures == 0 and st.get("alert_active", False):
             recovered_candidates.append((sid, site["name"]))
 
-        # ---- Silent / empty-scan ----
-        # Only evaluated for sites succeeding at the HTTP level; a failing
-        # site already produces its own alert, so we don't double-alert.
-        if st.get("baseline_complete") and failures == 0:
-            empty_scans = int(st.get("consecutive_empty_scans", 0))
-            if empty_scans >= empty_scan_threshold and not st.get("empty_alert_active", False):
-                last_empty_alert = st.get("last_empty_alert_at")
-                cooled = True
-                if last_empty_alert:
-                    try:
-                        last_dt = datetime.fromisoformat(last_empty_alert.replace("Z", "+00:00"))
-                        if last_dt.tzinfo is None:
-                            last_dt = last_dt.replace(tzinfo=timezone.utc)
-                        cooled = (now - last_dt).total_seconds() >= cooldown_hours * 3600
-                    except Exception:
-                        cooled = True
-                if cooled:
-                    empty_candidates.append((sid, site["name"], empty_scans))
-            elif empty_scans == 0 and st.get("empty_alert_active", False):
-                empty_recovered_candidates.append((sid, site["name"]))
-
-    # ---- Send failure alert ----
     if failing_candidates:
         lines = ["⚠️ <b>Site Failure Alert</b>", "", f"{len(failing_candidates)} site(s) failing:", ""]
         for sid, name, count, err in failing_candidates[:10]:
@@ -1277,7 +1329,6 @@ def _check_and_send_site_alerts(
         else:
             print(f"[WARN] Site failure alert not delivered; will retry: {detail}", file=sys.stderr)
 
-    # ---- Send failure recovery ----
     if recovered_candidates:
         lines = ["✅ <b>Site Recovery</b>", "", f"{len(recovered_candidates)} site(s) recovered:", ""]
         for sid, name in recovered_candidates[:10]:
@@ -1290,45 +1341,6 @@ def _check_and_send_site_alerts(
                 st["last_recovery_at"] = utc_now()
         else:
             print(f"[WARN] Site recovery alert not delivered; will retry: {detail}", file=sys.stderr)
-
-    # ---- Send silent-site alert ----
-    if empty_candidates:
-        lines = [
-            "⚠️ <b>Site Silent Alert</b>",
-            "",
-            f"{len(empty_candidates)} site(s) returned 0 candidates:",
-            "",
-        ]
-        for sid, name, count in empty_candidates[:10]:
-            lines.append(f"• <b>{html.escape(name)}</b> — {count} empty scan(s)")
-        lines.append("")
-        lines.append("<i>Site HTML structure may have changed; notices are no longer being parsed.</i>")
-        ok, _permanent, detail = send_telegram(token, chat_id, "\n".join(lines))
-        if ok:
-            for sid, _name, _count in empty_candidates:
-                st = site_state(state, sid)
-                st["empty_alert_active"] = True
-                st["last_empty_alert_at"] = utc_now()
-        else:
-            print(f"[WARN] Site silent alert not delivered; will retry: {detail}", file=sys.stderr)
-
-    # ---- Send silent-site recovery ----
-    if empty_recovered_candidates:
-        lines = [
-            "✅ <b>Site Recovered (Silent)</b>",
-            "",
-            f"{len(empty_recovered_candidates)} site(s) produced candidates again:",
-            "",
-        ]
-        for sid, name in empty_recovered_candidates[:10]:
-            lines.append(f"• {html.escape(name)}")
-        ok, _permanent, detail = send_telegram(token, chat_id, "\n".join(lines))
-        if ok:
-            for sid, _name in empty_recovered_candidates:
-                st = site_state(state, sid)
-                st["empty_alert_active"] = False
-        else:
-            print(f"[WARN] Site silent recovery alert not delivered; will retry: {detail}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -1408,10 +1420,6 @@ def find_fuzzy_match(site_items, title, url):
 
     Path overlap permits a slightly lower title threshold. With unrelated paths,
     require a longer, near-identical title to avoid merging unrelated notices.
-
-    A digits-only guard rejects matches where titles differ only by numbers
-    (e.g. "... 2026" vs "... 2027"), which fuzzy scoring alone would merge
-    even at high thresholds because path overlap boosts similarity.
     """
     if not site_items or not title:
         return None
@@ -1426,17 +1434,6 @@ def find_fuzzy_match(site_items, title, url):
         existing_norm = _normalize_title(existing_title)
         if len(existing_norm) < 12:
             continue
-
-        # Hard guard: titles that differ only by digits represent distinct
-        # notices (years, serials, advertisement numbers) and must never merge.
-        new_alpha = re.sub(r"\d+", "#", new_title).strip()
-        old_alpha = re.sub(r"\d+", "#", existing_norm).strip()
-        if new_alpha and new_alpha == old_alpha:
-            new_nums = re.findall(r"\d+", new_title)
-            old_nums = re.findall(r"\d+", existing_norm)
-            if new_nums != old_nums:
-                continue
-
         existing_segs = _url_path_segments(existing_url)
         overlap = bool(new_segs and existing_segs and (new_segs & existing_segs))
         # token_sort_ratio penalizes missing/distinctive words; token_set_ratio can
@@ -1469,32 +1466,7 @@ def extract_candidates(html_text, page_url, site, scan):
         if _is_navigation_url(href):
             continue
         title = clean_text(a.get_text(" ", strip=True), 300)
-
-        # Generic titles alone should not disqualify a link when the URL
-        # itself is clearly a notice/document endpoint. This fixes sites
-        # (e.g. Ranchi) where notice anchors use labels like "View" or
-        # "Read More" and were previously filtered out before scoring.
-        href_lower_early = href.lower()
-        url_looks_like_notice = (
-            "/notice/" in href_lower_early
-            or "/notices/" in href_lower_early
-            or "/document/" in href_lower_early
-            or "/documents/" in href_lower_early
-            or "/writereaddata/" in href_lower_early
-            or "/uploadfile/" in href_lower_early
-            or "/uploads/" in href_lower_early
-            or "/downloadfile/" in href_lower_early
-            or "/download_file/" in href_lower_early
-            or "/getfile/" in href_lower_early
-            or "/showfile/" in href_lower_early
-            or "/viewfile/" in href_lower_early
-            or "/filedownload/" in href_lower_early
-            or ".pdf" in href_lower_early
-            or "post_type=notice" in href_lower_early
-            or "post_type=document" in href_lower_early
-        )
-
-        if _is_generic_title(title) and not url_looks_like_notice:
+        if _is_generic_title(title):
             continue
 
         parent = a.find_parent("tr")
@@ -1584,8 +1556,33 @@ def discover_from_sitemap(session, base_url, scan):
         return []
 
 
+def _robots_allowed(session, url, timeout):
+    """Respect a site's robots.txt when available; fail open only on fetch/parse errors."""
+    parsed = urlparse(url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    if origin not in _ROBOTS_CACHE:
+        parser = RobotFileParser()
+        robots_url = origin + "/robots.txt"
+        try:
+            response = session.get(robots_url, timeout=min(10, timeout), allow_redirects=True)
+            if response.status_code < 400 and response.text:
+                parser.set_url(robots_url)
+                parser.parse(response.text.splitlines())
+                _ROBOTS_CACHE[origin] = parser
+            else:
+                _ROBOTS_CACHE[origin] = None
+        except Exception:
+            _ROBOTS_CACHE[origin] = None
+    parser = _ROBOTS_CACHE.get(origin)
+    if parser is None:
+        return True
+    try:
+        return parser.can_fetch(USER_AGENT, url)
+    except Exception:
+        return True
+
 def discover_site(session, site, scan):
-    """⭐ UPDATED: Archive pages fetched (with budget), pagination capped."""
+    """Discover bounded listing/archive/pagination/sitemap pages while respecting robots.txt."""
     base_url = site["url"]
     timeout = scan["request_timeout_seconds"]
     max_pages = scan["max_discovery_pages_per_site"]
@@ -1637,6 +1634,14 @@ def discover_site(session, site, scan):
             normal_visited_count += 1
 
         try:
+            if not _robots_allowed(session, page, timeout):
+                print(f"[ROBOTS-SKIP] {page}", file=sys.stderr)
+                continue
+            # Per-site requests are sequential; a small inter-request delay avoids
+            # hammering a single district domain while 24 sites are scanned in parallel.
+            domain_delay = float(scan.get("domain_delay_seconds", 1.0) or 0.0)
+            if domain_delay > 0 and visited:
+                time.sleep(min(domain_delay, 10.0))
             response = session.get(page, timeout=timeout, allow_redirects=True)
             if response.status_code >= 400:
                 raise RuntimeError(f"HTTP {response.status_code}")
@@ -1697,11 +1702,7 @@ def discover_site(session, site, scan):
 
 
 def scan_site(site, scan):
-    session = make_session()
-    try:
-        return discover_site(session, site, scan)
-    finally:
-        session.close()
+    return discover_site(make_session(), site, scan)
 
 
 # ---------------------------------------------------------------------------
@@ -1863,8 +1864,8 @@ def download_pdf_content(pdf_url, timeout=30):
     if pdf_url in _RUNTIME_PDF_CACHE:
         content = _RUNTIME_PDF_CACHE[pdf_url]
     else:
-        session = make_session()
         try:
+            session = make_session()
             content, actual_url, method = _download_with_pdf_resolution(session, pdf_url, timeout)
             if not content:
                 return None, "", False, method
@@ -1876,8 +1877,6 @@ def download_pdf_content(pdf_url, timeout=30):
         except Exception as exc:
             print(f"[WARN] PDF download failed for {pdf_url}: {exc}", file=sys.stderr)
             return None, "", False, "download_error"
-        finally:
-            session.close()
 
     text = _extract_pdf_text_plumber(content)
     extraction_method = "plumber"
@@ -2623,8 +2622,8 @@ def send_notification_with_pdf(token, chat_id, record, full_message):
     filename = _safe_filename(pdf_url)
     pdf_bytes = _RUNTIME_PDF_CACHE.get(pdf_url)
     if pdf_bytes is None:
-        session = make_session()
         try:
+            session = make_session()
             content, actual_url, method = _download_with_pdf_resolution(session, pdf_url, 30)
             if content and len(content) <= MAX_PDF_SEND_BYTES:
                 pdf_bytes = content
@@ -2636,8 +2635,6 @@ def send_notification_with_pdf(token, chat_id, record, full_message):
                         filename = new_name
         except Exception as exc:
             print(f"[WARN] PDF download for send failed: {exc}", file=sys.stderr)
-        finally:
-            session.close()
     if not pdf_bytes:
         return send_telegram(token, chat_id, truncate_telegram(full_message))
     caption = _build_pdf_caption(full_message, record.get("classification"))
@@ -3362,6 +3359,9 @@ def prune_state(state, retention_days, max_items=3000, max_pending_attempts=72, 
             status = "permanent_error"
 
         if status in terminal:
+            # Status-specific retention: baseline records are shorter-lived than sent records.
+            status_days = {"sent": 90, "ignored": 30, "baseline": 60, "permanent_error": retention_days}.get(status, retention_days)
+            status_cutoff = now - timedelta(days=status_days)
             # Existing state migration: use first_seen once, not last_seen (which refreshes
             # every crawl and otherwise makes old records immortal).
             if not record.get("terminal_at"):
@@ -3385,7 +3385,7 @@ def prune_state(state, retention_days, max_items=3000, max_pending_attempts=72, 
                     dt = dt.replace(tzinfo=timezone.utc)
             except Exception:
                 dt = now
-            if dt < cutoff:
+            if dt < status_cutoff:
                 remove.append(key)
         else:
             # A re-opened/changed item is active again; don't carry a terminal timestamp.
@@ -3393,6 +3393,19 @@ def prune_state(state, retention_days, max_items=3000, max_pending_attempts=72, 
 
     for key in remove:
         items.pop(key, None)
+
+    # Review items are useful operationally but must not grow without bound.
+    review = state.setdefault("review_queue", {})
+    review_cutoff = now - timedelta(days=90)
+    for key, entry in list(review.items()):
+        stamp = _parse_utc_timestamp(entry.get("updated_at") or entry.get("first_seen")) if isinstance(entry, dict) else None
+        if not isinstance(entry, dict) or (stamp and stamp < review_cutoff and entry.get("status") != "open"):
+            review.pop(key, None)
+    if len(review) > 500:
+        ordered = sorted(review.items(), key=lambda kv: str((kv[1] or {}).get("updated_at", "")))
+        for key, _ in ordered[:len(review) - 500]:
+            if review.get(key, {}).get("status") != "open":
+                review.pop(key, None)
 
     # Hard item-count ceiling is a backstop in addition to age-based retention.
     if len(items) > max_items:
@@ -3608,18 +3621,16 @@ def _fetch_pdfs_for_batch(batch, scan):
                 record["pdf_text"] = text[:MAX_PDF_TEXT_CHARS]
                 record["pdf_extracted"] = True
                 record["ocr_used"] = bool(ocr_used)
-                pdf_dates = _extract_explicit_issue_dates(text)
-                if pdf_dates:
-                    now = datetime.now(timezone.utc)
-                    past = [d for d in pdf_dates if d <= now]
-                    if past:
-                        latest_pdf_date = max(past)
-                        cutoff = now - timedelta(days=STALE_NOTICE_DAYS)
-                        if latest_pdf_date < cutoff:
-                            record["status"] = "baseline"
-                            record["last_error"] = f"PDF content stale ({latest_pdf_date.date()})"
-                            print(f"[STALE-PDF] Explicit issue date {latest_pdf_date.date()} in {record.get('url','')[:80]}", file=sys.stderr)
-                            continue
+                if _is_stale_notice(
+                    record.get("title", ""), record.get("context", ""), record.get("url", ""),
+                    upload_date=_parse_upload_date(record.get("upload_date")), pdf_text=text,
+                ):
+                    record["status"] = "baseline"
+                    record["classification"] = None
+                    record["summary"] = ""
+                    record["last_error"] = f"PDF content stale (limit={STALE_NOTICE_DAYS}d or old year)"
+                    print(f"[STALE-PDF] Suppressed old PDF notice: {record.get('url','')[:80]}", file=sys.stderr)
+                    continue
 
 
 def _parse_upload_date(raw):
@@ -3632,6 +3643,27 @@ def _parse_upload_date(raw):
         return dt
     except Exception:
         return None
+
+
+def suppress_stale_pending_and_ready(state):
+    """Prevent stale persisted work items from bypassing the candidate date gate."""
+    changed = 0
+    for record in state.get("items", {}).values():
+        if not isinstance(record, dict) or record.get("status") not in {"pending", "ready"}:
+            continue
+        if _is_stale_notice(
+            record.get("title", ""), record.get("context", ""), record.get("url", ""),
+            upload_date=_parse_upload_date(record.get("upload_date")),
+            pdf_text=record.get("pdf_text", ""),
+        ):
+            record["status"] = "baseline"
+            record["classification"] = None
+            record["summary"] = ""
+            record["last_error"] = f"Stale persisted item suppressed (limit={STALE_NOTICE_DAYS}d or old year)"
+            changed += 1
+    if changed:
+        print(f"[STALE-SKIP] Suppressed {changed} stale persisted item(s)", file=sys.stderr)
+    return changed
 
 
 def enqueue_persisted_pending(state, pending, max_pending_attempts, configured_site_ids):
@@ -3710,13 +3742,18 @@ def main():
                 results[sid] = {"candidates": candidates, "errors": errors, "success": success}
                 if success:
                     mark_site_success(state, sid, len(candidates))
+                    state["metrics"]["site_scan_success"][sid] = state["metrics"]["site_scan_success"].get(sid, 0) + 1
+                    if errors:
+                        state["metrics"]["parse_errors"] = int(state["metrics"].get("parse_errors", 0)) + len(errors)
                     print(f"[OK] {site['name']}: {len(candidates)} candidate(s), {len(errors)} partial error(s)")
                 else:
                     run_errors += 1
+                    state["metrics"]["site_scan_failure"][sid] = state["metrics"]["site_scan_failure"].get(sid, 0) + 1
                     mark_site_failure(state, sid, "; ".join(errors) or "No page could be fetched")
                     print(f"[ERROR] {site['name']}: no page could be fetched", file=sys.stderr)
             except Exception as exc:
                 run_errors += 1
+                state["metrics"]["site_scan_failure"][site["id"]] = state["metrics"]["site_scan_failure"].get(site["id"], 0) + 1
                 results[site["id"]] = {"candidates": [], "errors": [str(exc)], "success": False}
                 mark_site_failure(state, site["id"], str(exc))
                 print(f"[ERROR] {site['name']}: {exc}", file=sys.stderr)
@@ -3725,12 +3762,7 @@ def main():
     try:
         threshold = scan.get("site_alert_threshold", 3)
         cooldown = scan.get("site_alert_cooldown_hours", 6)
-        empty_threshold = scan.get("site_empty_scan_threshold_runs", 72)
-        _check_and_send_site_alerts(
-            state, cfg, token, chat_id,
-            threshold, cooldown,
-            empty_threshold,
-        )
+        _check_and_send_site_alerts(state, cfg, token, chat_id, threshold, cooldown)
     except Exception as exc:
         print(f"[WARN] Site alert check failed: {exc}", file=sys.stderr)
 
@@ -3744,7 +3776,8 @@ def main():
         candidates = result["candidates"]
         current_scan_success = bool(result["success"])
 
-        if not ss["baseline_complete"] and current_scan_success:
+        baseline_scan_complete = baseline_can_complete(current_scan_success, result.get("errors", []))
+        if not ss["baseline_complete"] and baseline_scan_complete:
             for candidate in candidates:
                 iid = item_id(sid, candidate["url"], candidate["title"], candidate.get("context", ""))
                 state["items"].setdefault(iid, {
@@ -3762,7 +3795,14 @@ def main():
                     "etag": None, "last_modified": None, "pdf_hash": None, "pdf_hash_kind": None, "last_content_check_at": None,
                 })
             ss["baseline_complete"] = True
+            ss["baseline_completed_at"] = utc_now()
+            ss.pop("baseline_pending_reason", None)
             print(f"[BASELINE] {site['name']} initialized with {len(candidates)} item(s)")
+            continue
+        elif not ss["baseline_complete"]:
+            ss["baseline_pending_reason"] = "scan failed or partial errors; baseline withheld to prevent archive spam"
+            print(f"[BASELINE-PENDING] {site['name']}: waiting for a complete scan", file=sys.stderr)
+            # Do not classify or notify any candidates from an incomplete baseline scan.
             continue
 
         site_items_list = site_index.get(sid, [])
@@ -3770,6 +3810,45 @@ def main():
         for candidate in candidates:
             iid = item_id(sid, candidate["url"], candidate["title"], candidate.get("context", ""))
             record = state["items"].get(iid)
+            upload_dt = _parse_upload_date(candidate.get("upload_date"))
+
+            # Apply the stale gate to EVERY discovered candidate, not only brand-new
+            # IDs. This prevents an old archive notice from being re-queued merely
+            # because its title/context changed or a prior pending record was restored.
+            if _is_stale_notice(
+                candidate.get("title", ""), candidate.get("context", ""),
+                candidate.get("url", ""), upload_date=upload_dt,
+            ):
+                matched_iid = iid if record is not None else find_url_match(site_items_list, candidate["url"])
+                if not matched_iid and record is None:
+                    matched_iid = find_fuzzy_match(site_items_list, candidate.get("title", ""), candidate.get("url", ""))
+                if matched_iid and matched_iid in state["items"]:
+                    stale_record = state["items"][matched_iid]
+                    stale_record["last_seen"] = utc_now()
+                    if stale_record.get("status") not in {"sent", "ignored", "permanent_error"}:
+                        stale_record["status"] = "baseline"
+                        stale_record["classification"] = None
+                        stale_record["summary"] = ""
+                        stale_record["last_error"] = f"Stale notice (limit={STALE_NOTICE_DAYS}d or old year)"
+                else:
+                    state["items"][iid] = {
+                        "site_id": sid, "site_name": site["name"],
+                        "url": candidate["url"], "title": candidate.get("title", ""),
+                        "context": candidate.get("context", "")[:700],
+                        "is_pdf": bool(candidate.get("is_pdf")),
+                        "first_seen": utc_now(), "last_seen": utc_now(),
+                        "status": "baseline", "attempts": 0, "summary": "",
+                        "classification": None, "pdf_extracted": False,
+                        "pdf_text": "", "pdf_attempts": 0, "ocr_used": False,
+                        "pdf_method": "", "telegram_attempts": 0, "pdf_sent": False,
+                        "upload_date": candidate.get("upload_date"),
+                        "last_error": f"Stale notice (limit={STALE_NOTICE_DAYS}d or old year)",
+                        "etag": None, "last_modified": None, "pdf_hash": None,
+                        "pdf_hash_kind": None, "last_content_check_at": None,
+                    }
+                    site_items_list.append((iid, candidate.get("title", ""), candidate.get("url", "")))
+                print(f"[STALE-SKIP] {candidate.get('title', '')[:80]}", file=sys.stderr)
+                continue
 
             url_lower = candidate["url"].lower()
             is_pdf_or_notice = (
@@ -3786,6 +3865,7 @@ def main():
                 if not matched_iid:
                     matched_iid = find_fuzzy_match(site_items_list, candidate["title"], candidate["url"])
                 if matched_iid and matched_iid in state["items"]:
+                    state["metrics"]["duplicate_rejects"] = int(state["metrics"].get("duplicate_rejects", 0)) + 1
                     iid = matched_iid
                     record = state["items"][matched_iid]
                     old_title = clean_text(record.get("title", ""), 300)
@@ -3877,8 +3957,8 @@ def main():
                         should_check = True
 
                     if should_check:
-                        session = make_session()
                         try:
+                            session = make_session()
                             changed, new_etag, new_lm = _check_url_changed(
                                 session, candidate["url"], record
                             )
@@ -3900,8 +3980,6 @@ def main():
                             record["last_content_check_at"] = utc_now()
                         except Exception as exc:
                             print(f"[WARN] ETag check failed: {exc}", file=sys.stderr)
-                        finally:
-                            session.close()
 
                 if record.get("status") == "baseline":
                     old_title = (record.get("title") or "").strip()
@@ -3934,9 +4012,14 @@ def main():
             ):
                 pending.append((iid, record))
 
+    # Old pending/ready items can survive in state even when no longer present in a
+    # site's current listing. Suppress them before restoring the persisted queue.
+    suppress_stale_pending_and_ready(state)
+    pending = [(iid, record) for iid, record in pending if record.get("status") == "pending"]
+
     # Sweep ALL persisted pending records, not only candidates visible in this scan.
-    # This prevents pending notices getting stranded when a district site is down or
-    # a listing page changes before the next successful run.
+    # This prevents fresh pending notices getting stranded when a district site is down
+    # or a listing page changes before the next successful run.
     pending = enqueue_persisted_pending(
         state,
         pending,
@@ -3985,7 +4068,10 @@ def main():
                 if classification is None:
                     record["status"] = "pending"
                     record["last_error"] = "Gemini returned no classification"
+                    add_review_item(state, record, "classification_missing")
                     continue
+                if classification.get("ambiguous") is True or classification.get("needs_review") is True:
+                    add_review_item(state, record, "Gemini marked notice ambiguous", classification)
                 record["last_error"] = None
                 record["classification"] = classification
                 record["summary"] = classification.get("summary", "")
@@ -4034,18 +4120,21 @@ def main():
 
         record["telegram_attempts"] = int(record.get("telegram_attempts", 0)) + 1
         if ok:
+            state["metrics"]["sent_notifications"] = int(state["metrics"].get("sent_notifications", 0)) + 1
             record["status"] = "sent"
             record["last_error"] = None
             record.pop("telegram_next_attempt_at", None)
             record.pop("telegram_first_failed_at", None)
             sent_count += 1
         elif permanent:
+            state["metrics"]["failed_notifications"] = int(state["metrics"].get("failed_notifications", 0)) + 1
             record["status"] = "permanent_error"
             record["last_error"] = detail
             record.pop("telegram_next_attempt_at", None)
             run_errors += 1
             print(f"[ERROR] Permanent Telegram error: {detail}", file=sys.stderr)
         else:
+            state["metrics"]["failed_notifications"] = int(state["metrics"].get("failed_notifications", 0)) + 1
             record["status"] = "ready"
             record["last_error"] = detail
             _schedule_telegram_retry(record)
@@ -4100,6 +4189,7 @@ def main():
         except OSError:
             pass
     except Exception as exc:
+        state.setdefault("metrics", {})["state_save_failures"] = int(state.get("metrics", {}).get("state_save_failures", 0)) + 1
         # A failed save must fail the process. Never retry an unchecked save here:
         # it could overwrite the last known-good state with an oversized/broken file.
         print(f"[FATAL] State save failed: {exc}", file=sys.stderr)
@@ -4112,6 +4202,8 @@ def main():
         f"sent_this_run={sent_count} "
         f"pending={state['stats']['pending']} "
         f"errors_this_run={run_errors} "
+        f"review_open={sum(1 for x in state.get('review_queue', {}).values() if x.get('status') == 'open')} "
+        f"duplicate_rejects={state.get('metrics', {}).get('duplicate_rejects', 0)} "
         f"elapsed={elapsed:.1f}s"
     )
     return 0
