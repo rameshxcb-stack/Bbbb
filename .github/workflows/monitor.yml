@@ -1,3 +1,4 @@
+```yaml
 name: Jharkhand District Notification Monitor
 
 on:
@@ -18,10 +19,11 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
+          persist-credentials: true
 
       - name: Load persistent monitor state
         id: load_state
@@ -29,35 +31,51 @@ jobs:
         run: |
           set -euo pipefail
 
-          git ls-remote --heads origin monitor-state > /tmp/monitor-state-ref.txt
+          # Capture the branch SHA so publishing cannot overwrite
+          # a state branch updated by another process.
+          git ls-remote --heads origin refs/heads/monitor-state \
+            > /tmp/monitor-state-ref.txt
 
-          if [ -s /tmp/monitor-state-ref.txt ]; then
+          BRANCH_SHA="$(awk 'NR == 1 {print $1}' /tmp/monitor-state-ref.txt)"
+          echo "branch_sha=${BRANCH_SHA}" >> "$GITHUB_OUTPUT"
+
+          if [ -n "$BRANCH_SHA" ]; then
             git fetch --no-tags origin monitor-state
             git show FETCH_HEAD:state.json > state.json
             test -s state.json
-            echo "Loaded state from monitor-state branch"
-          elif [ -f state.json ]; then
-            echo "No monitor-state branch yet; migrating existing repository state.json"
+
+            python -m json.tool state.json >/dev/null
+            echo "Loaded persistent state from monitor-state."
+          elif [ -f state.json ] && [ -s state.json ]; then
+            python -m json.tool state.json >/dev/null
+            echo "No monitor-state branch exists; using repository state.json."
           else
-            echo "No prior state found; monitor will initialize a new state file"
+            echo "No previous state found; monitor may initialize state.json."
           fi
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: "pip"
 
-      - name: Install Python dependencies
+      - name: Install dependencies
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: Run regression tests
+        run: |
+          set -euo pipefail
+          python -m unittest discover -s tests -v
 
       - name: Run notification monitor
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
           NOTIFY_LANGUAGE: "both"
           OCR_ENABLED: "true"
           OCR_DPI: "150"
@@ -66,65 +84,88 @@ jobs:
           GEMINI_MAX_OUTPUT_TOKENS: "16384"
           GEMINI_PDF_OCR_ENABLED: "true"
           STALE_NOTICE_DAYS: "10"
+
         run: |
+          set -euo pipefail
           python monitor.py
 
-      - name: Persist state in a single-commit branch
+      - name: Validate state before saving
+        id: validate_state
         if: ${{ always() && steps.load_state.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
 
           if [ ! -s state.json ]; then
-            echo "::error::state.json is missing or empty; refusing to overwrite persistent state"
+            echo "::error::state.json is missing or empty."
             exit 1
           fi
 
-          python -m json.tool state.json >/dev/null || {
-            echo "::error::state.json is invalid JSON; refusing to overwrite persistent state"
-            exit 1
-          }
-
-          state_bytes=$(wc -c < state.json | tr -d ' ')
-
-          if [ "$state_bytes" -gt 3100000 ]; then
-            echo "::error::state.json exceeds the 3.1 MB persistence guard (${state_bytes} bytes); previous monitor-state branch will be preserved"
+          if ! python -m json.tool state.json >/dev/null; then
+            echo "::error::state.json is invalid JSON."
             exit 1
           fi
 
-          echo "State size accepted: ${state_bytes} bytes"
+          STATE_BYTES="$(wc -c < state.json | tr -d ' ')"
+
+          if [ "$STATE_BYTES" -gt 3100000 ]; then
+            echo "::error::state.json exceeds the 3.1 MB safety limit."
+            exit 1
+          fi
+
+          echo "Validated state size: ${STATE_BYTES} bytes"
           cp state.json /tmp/jharkhand-monitor-state.json
 
-          # Discard local modifications to tracked files (state.json) since we
-          # already backed up the updated content to /tmp. Without this, git
-          # refuses to switch to the orphan branch because state.json has
-          # uncommitted changes that would be overwritten.
-          git checkout -- . 2>/dev/null || true
-          git clean -fd 2>/dev/null || true
+      - name: Publish state safely
+        if: ${{ always() && steps.validate_state.outcome == 'success' }}
+        shell: bash
+        env:
+          EXPECTED_STATE_SHA: ${{ steps.load_state.outputs.branch_sha }}
+        run: |
+          set -euo pipefail
 
+          # Publish in a separate worktree so the monitor's source files,
+          # untracked files and local changes are not cleaned or discarded.
+          PUBLISH_DIR="/tmp/jharkhand-state-publish"
+
+          git worktree add --detach "$PUBLISH_DIR" "$GITHUB_SHA"
+
+          cd "$PUBLISH_DIR"
           git switch --orphan state-update
-          git rm -rf . >/dev/null 2>&1 || true
+
+          # Remove tracked files from this temporary worktree only.
+          git rm -rf --ignore-unmatch .
+
           cp /tmp/jharkhand-monitor-state.json state.json
-          git add state.json
+          python -m json.tool state.json >/dev/null
+          git add -- state.json
 
           git -c user.name="github-actions[bot]" \
               -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
               commit -m "Update monitor state"
 
-          pushed=false
+          # Compare-and-swap: only update the branch if it is still
+          # at the SHA loaded at the start of this run.
+          PUSHED=false
 
-          for i in 1 2 3; do
-            if git push --force origin HEAD:monitor-state; then
-              pushed=true
-              echo "State push succeeded on attempt $i"
+          for ATTEMPT in 1 2 3; do
+            if git push \
+              "--force-with-lease=refs/heads/monitor-state:${EXPECTED_STATE_SHA}" \
+              origin HEAD:refs/heads/monitor-state; then
+
+              PUSHED=true
+              echo "Persistent state saved successfully."
               break
             fi
 
-            echo "State push attempt $i failed; retrying..."
-            sleep 4
+            echo "::warning::State push attempt ${ATTEMPT} failed."
+
+            if [ "$ATTEMPT" -lt 3 ]; then
+              sleep 4
+            fi
           done
 
-          if [ "$pushed" != "true" ]; then
-            echo "::error::Could not persist monitor-state after 3 attempts"
+          if [ "$PUSHED" != "true" ]; then
+            echo "::error::State was not saved. The branch may have changed during this run. Rerun the workflow to load the latest state."
             exit 1
           fi
