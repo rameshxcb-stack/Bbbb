@@ -57,7 +57,6 @@ MAX_PDF_SEND_BYTES = 45 * 1024 * 1024
 MAX_GEMINI_PDF_BYTES = 18 * 1024 * 1024
 MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "8"))
 MAX_PDF_TEXT_CHARS = 4000
-# Raw text (with newlines) preserved for title/summary extraction
 MAX_PDF_RAW_TEXT_CHARS = 8000
 MAX_PDF_ATTEMPTS = 3
 TELEGRAM_SAFE_LIMIT = 4000
@@ -612,7 +611,6 @@ def _extract_explicit_title(soup):
             return ""
         return value
 
-    # Labels and values sometimes appear together in one cell/line.
     for node in soup.find_all(["td", "th", "dd", "p", "div", "li", "span"]):
         text_value = clean_text(node.get_text(" ", strip=True), 600)
         match = _TITLE_INLINE_RE.match(text_value)
@@ -621,7 +619,6 @@ def _extract_explicit_title(soup):
             if value:
                 return value
 
-    # Label/value tables: <tr><td>Title[:]?</td><td>...</td></tr>
     for tr in soup.find_all("tr"):
         cells = tr.find_all(["th", "td"], recursive=False)
         if len(cells) >= 2:
@@ -635,7 +632,6 @@ def _extract_explicit_title(soup):
                 if value:
                     return value
 
-    # Definition lists: <dt>Title</dt><dd>...</dd>
     for dt in soup.find_all("dt"):
         label = clean_text(dt.get_text(" ", strip=True), 100)
         if re.match(r"^\s*(?:document\s+title|title|subject|शीर्षक|विषय|दस्तावेज़\s*शीर्षक)\s*[:：]?\s*$", label, re.IGNORECASE):
@@ -645,7 +641,6 @@ def _extract_explicit_title(soup):
                 if value:
                     return value
 
-    # Label-like elements followed by a value in a sibling or parent container.
     for label_node in soup.find_all(["b", "strong", "label"]):
         label = clean_text(label_node.get_text(" ", strip=True), 100)
         if not re.match(r"^\s*(?:document\s+title|title|subject|शीर्षक|विषय|दस्तावेज़\s*शीर्षक)\s*[:：]?\s*$", label, re.IGNORECASE):
@@ -1056,7 +1051,6 @@ _UPLOAD_DATE_TEXT_PATTERNS = [
 def _extract_explicit_issue_dates(text):
     if not text:
         return []
-    # Normalize Devanagari digits so "दिनांक १५/१०/२०२६" is parsed.
     text = str(text).translate(_DEVA_DIGIT_TRANS)
     dates = []
     for pattern in _UPLOAD_DATE_TEXT_PATTERNS:
@@ -1104,13 +1098,6 @@ def _extract_upload_date(anchor_tag):
 
 
 def _is_stale_notice(title, context, url, upload_date=None, pdf_text=None):
-    """Return True only when there is reasonable evidence a notice is stale.
-
-    Normalize Devanagari digits before year/date checks. The menu-dump guard is
-    deliberately conservative: a long title is rejected only when it also has
-    several navigation labels, avoiding false positives for legitimate Hindi
-    government-document titles.
-    """
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=STALE_NOTICE_DAYS)
     title_text = str(title or "")
@@ -1193,11 +1180,6 @@ def utc_now():
 
 
 def clean_text(value, limit=500):
-    """
-    Collapse whitespace (including newlines) into single spaces.
-    Used for display/storage. NOTE: for title/summary extraction from PDF
-    always use the RAW text before this function is applied.
-    """
     value = re.sub(r"\s+", " ", value or "").strip()
     return value[:limit]
 
@@ -1746,8 +1728,6 @@ def extract_candidates(html_text, page_url, site, scan):
     out.sort(key=lambda x: (-x["score"], x["title"].lower()))
     out = out[: scan["max_items_per_site"]]
     # Only attach the page's explicit title when there is exactly one candidate.
-    # Keep candidate["title"] unchanged so item IDs, matching, and stale checks
-    # continue to use the original link-derived metadata.
     if len(out) == 1:
         explicit_title = _extract_explicit_title(soup)
         if explicit_title:
@@ -1948,7 +1928,6 @@ def _extract_pdf_text_plumber(content):
                     print(f"[WARN] Page {idx+1} table extract failed: {exc}", file=sys.stderr)
     except Exception as exc:
         print(f"[WARN] pdfplumber open failed: {exc}", file=sys.stderr)
-    # Preserve paragraph structure: join page texts with double newline.
     return "\n\n".join(parts)
 
 
@@ -2068,7 +2047,7 @@ def _text_looks_thin(text):
 
 
 # ---------------------------------------------------------------------------
-# PDF title + summary extraction (works on RAW text with newlines)
+# PDF title + summary extraction
 # ---------------------------------------------------------------------------
 
 _TITLE_KEYWORDS = (
@@ -2085,7 +2064,6 @@ _BOILERPLATE_HINTS = (
 
 
 def _score_pdf_title_line(line, index):
-    """Score a single PDF line for its likelihood of being the notice title."""
     if not line:
         return -1
     ln = line.strip()
@@ -2116,17 +2094,6 @@ def _score_pdf_title_line(line, index):
 
 
 def _extract_pdf_title_and_summary(raw_pdf_text, fallback_title=""):
-    """
-    Extract a better title + a distinct summary from RAW PDF text.
-
-    Returns (better_title, summary):
-      - better_title falls back to fallback_title if nothing better is found.
-      - summary is "" if nothing distinct can be found (never repeats the title).
-
-    IMPORTANT: `raw_pdf_text` must be the raw extracted text BEFORE any
-    whitespace-collapsing (i.e. before clean_text). Otherwise line breaks
-    are lost and this function cannot distinguish title from body.
-    """
     if not raw_pdf_text:
         return fallback_title, ""
 
@@ -2168,15 +2135,6 @@ def _extract_pdf_title_and_summary(raw_pdf_text, fallback_title=""):
 
 
 def download_pdf_content(pdf_url, timeout=30):
-    """
-    Download + extract PDF text.
-
-    Returns a 5-tuple:
-        (content_bytes, cleaned_text, ocr_used, method, raw_text_with_newlines)
-
-    `raw_text_with_newlines` preserves line structure for title/summary
-    extraction. Do not pass the cleaned text to _extract_pdf_title_and_summary.
-    """
     global _RUNTIME_PDF_CACHE
     if pdf_url in _RUNTIME_PDF_CACHE:
         content = _RUNTIME_PDF_CACHE[pdf_url]
@@ -2228,12 +2186,6 @@ def download_pdf_content(pdf_url, timeout=30):
 # ---------------------------------------------------------------------------
 
 def keyword_fallback(items):
-    """
-    Fallback classification when Gemini is unavailable.
-
-    Summary is NEVER set equal to the title. Prefers pdf_summary_hint, then
-    context (if distinct), otherwise leaves summary empty.
-    """
     result = {}
     for index, item in enumerate(items):
         text = (f"{item.get('title', '')} {item.get('url', '')} "
@@ -3596,7 +3548,7 @@ _FORMATTERS = {
 
 def format_message(site, item, classification=None):
     classification = classification or {}
-    # Priority: explicit_title (from HTML) > title (anchor or PDF-upgraded)
+    # Priority: explicit_title (from website) > title (anchor) > context > URL slug
     raw_title = clean_text(item.get("explicit_title") or item.get("title") or "", 300)
     if not raw_title or _is_generic_title(raw_title) or _is_language_selector(raw_title):
         raw_title = (
@@ -3884,6 +3836,13 @@ def _should_fetch_pdf(record):
         "/notice_category", "/notice-category",
         "/document-category", "/document_category",
         "/archive", "/search",
+        # Additional navigation-page patterns observed in production logs
+        "/contact-us", "/contact_us", "/contactus",
+        "/about-district", "/about_district",
+        "/photo-gallery", "/photo_gallery",
+        "/video-gallery", "/video_gallery",
+        "/dc-sp-contacts", "/dbim-home",
+        "/district-at-a-glance",
     )):
         return False
     try:
@@ -3947,24 +3906,26 @@ def _fetch_pdfs_for_batch(batch, scan):
                 record["pdf_extracted"] = True
                 record["ocr_used"] = bool(ocr_used)
 
-                # Skip PDF title upgrade when the HTML page already supplied
-                # an explicit_title — that is authoritative.
-                if not record.get("explicit_title"):
-                    try:
-                        better_title, pdf_summary = _extract_pdf_title_and_summary(
-                            raw_pdf_text or text,
-                            record.get("title", ""),
-                        )
-                        if better_title and better_title != record.get("title", ""):
-                            print(
-                                f"[TITLE-UPGRADE] {record.get('title','')[:50]} → {better_title[:70]}",
-                                file=sys.stderr,
-                            )
-                            record["title"] = better_title
-                        if pdf_summary:
-                            record["pdf_summary_hint"] = pdf_summary
-                    except Exception as exc:
-                        print(f"[WARN] Title upgrade failed: {exc}", file=sys.stderr)
+                # -----------------------------------------------------------------
+                # PDF TITLE UPGRADE IS DISABLED.
+                #
+                # In production this heuristic repeatedly picked the wrong line
+                # (PDF body text, table rows, or OCR garbage) and overrode the
+                # website-provided title. Website title (explicit_title) and the
+                # anchor/context title chain are far more reliable.
+                #
+                # We still extract a distinct summary hint from the PDF, but we
+                # never override the title.
+                # -----------------------------------------------------------------
+                try:
+                    _bt, pdf_summary = _extract_pdf_title_and_summary(
+                        raw_pdf_text or text,
+                        record.get("title", ""),
+                    )
+                    if pdf_summary and not record.get("pdf_summary_hint"):
+                        record["pdf_summary_hint"] = pdf_summary
+                except Exception as exc:
+                    print(f"[WARN] PDF summary extraction failed: {exc}", file=sys.stderr)
 
                 if _is_stale_notice(
                     record.get("title", ""), record.get("context", ""), record.get("url", ""),
@@ -4041,7 +4002,7 @@ def main():
 
     import time as _time
     _START_TIME = _time.monotonic()
-    _MAX_RUN_SECONDS = 27 * 60
+    _MAX_RUN_SECONDS = 35 * 60
 
     def _time_exceeded():
         return (_time.monotonic() - _START_TIME) > _MAX_RUN_SECONDS
@@ -4396,7 +4357,7 @@ def main():
     batch_size = scan["gemini_batch_size"]
     for start in range(0, len(pending), batch_size):
         if _time_exceeded():
-            print("[TIME_LIMIT] 27-minute processing budget reached — leaving remaining items pending for next run", file=sys.stderr)
+            print("[TIME_LIMIT] Processing budget reached — leaving remaining items pending for next run", file=sys.stderr)
             break
 
         batch = pending[start : start + batch_size]
@@ -4446,7 +4407,7 @@ def main():
     sent_count = 0
     for iid, record in ready[: scan["max_new_items_per_run"]]:
         if _time_exceeded():
-            print("[TIME_LIMIT] 27-minute processing budget reached — leaving unsent notices ready for next run", file=sys.stderr)
+            print("[TIME_LIMIT] Processing budget reached — leaving unsent notices ready for next run", file=sys.stderr)
             break
 
         site = next((s for s in cfg["websites"] if s["id"] == record.get("site_id")), None)
