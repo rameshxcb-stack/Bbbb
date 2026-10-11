@@ -61,6 +61,8 @@ MAX_PDF_ATTEMPTS = 3
 TELEGRAM_SAFE_LIMIT = 4000
 TELEGRAM_CAPTION_LIMIT = 1024
 
+# Raw text (with newlines) preserved for title/summary extraction
+
 _RUNTIME_PDF_CACHE_MAX_ITEMS = 50
 
 GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "16384"))
@@ -138,11 +140,9 @@ def _cache_put(url, content):
 def _load_gemini_keys():
     """
     Load unique Gemini keys from any of the supported env vars.
-
-    IMPORTANT: Every source is comma-split, so the user can paste multiple
-    keys into EITHER GEMINI_API_KEYS (recommended) OR GEMINI_API_KEY (legacy)
+    Every source is comma-split, so the user can paste multiple keys into
+    EITHER GEMINI_API_KEYS (recommended) OR GEMINI_API_KEY (legacy)
     using the form:  key1,key2,key3
-    Duplicate keys are ignored while preserving order.
     """
     keys = []
     seen = set()
@@ -154,16 +154,10 @@ def _load_gemini_keys():
                 seen.add(key)
                 keys.append(key)
 
-    # Primary source (recommended): comma-separated list.
     add(os.getenv("GEMINI_API_KEYS", ""))
-
-    # Optional numbered secrets: GEMINI_API_KEY_1 .. GEMINI_API_KEY_10
     for i in range(1, 11):
         add(os.getenv(f"GEMINI_API_KEY_{i}", ""))
-
-    # Legacy single-key env var. Also comma-split for convenience.
     add(os.getenv("GEMINI_API_KEY", ""))
-
     return keys
 
 
@@ -1038,7 +1032,6 @@ def _is_stale_notice(title, context, url, upload_date=None, pdf_text=None):
 
     title_years = [int(y) for y in re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", title_text)]
     current_year = now.year
-    update_words = r"(?:updated|update|revised|revision|corrigendum|addendum|amended|modified|नया संशोधन|संशोधित|अद्यतन|शुद्धिपत्र)"
     current_year_update = bool(re.search(
         rf"(?:revised|revision|corrigendum|addendum|amended|modified|संशोधित|शुद्धिपत्र).{{0,50}}{current_year}|{current_year}.{{0,50}}(?:revised|revision|corrigendum|addendum|amended|modified|संशोधित|शुद्धिपत्र)",
         f"{title_text} {context_text}", re.I
@@ -1077,6 +1070,11 @@ def utc_now():
 
 
 def clean_text(value, limit=500):
+    """
+    Collapse whitespace (including newlines) into single spaces.
+    Used for display/storage. NOTE: for title/summary extraction from PDF
+    always use the RAW text before this function is applied.
+    """
     value = re.sub(r"\s+", " ", value or "").strip()
     return value[:limit]
 
@@ -1560,6 +1558,15 @@ def extract_candidates(html_text, page_url, site, scan):
                 else:
                     continue
 
+        # If the anchor title is very short, try a longer phrase from context.
+        if len(title) < 20 and context:
+            parts = re.split(r"[|\-–—:]", context)
+            for p in parts:
+                p = clean_text(p.strip(), 200)
+                if len(p) >= 20 and not _is_generic_title(p) and not _is_language_selector(p):
+                    title = p
+                    break
+
         score = local_score(title, href, context, keywords)
         href_lower = href.lower()
         pdf_bonus = 0
@@ -1793,7 +1800,8 @@ def _extract_pdf_text_plumber(content):
                     print(f"[WARN] Page {idx+1} table extract failed: {exc}", file=sys.stderr)
     except Exception as exc:
         print(f"[WARN] pdfplumber open failed: {exc}", file=sys.stderr)
-    return "\n".join(parts)
+    # Preserve paragraph structure: join page texts with double newline.
+    return "\n\n".join(parts)
 
 
 def _extract_pdf_text_rapidocr(content):
@@ -1821,7 +1829,7 @@ def _extract_pdf_text_rapidocr(content):
         doc.close()
     except Exception as exc:
         print(f"[WARN] RapidOCR PDF processing failed: {exc}", file=sys.stderr)
-    return "\n".join(parts)
+    return "\n\n".join(parts)
 
 
 def _extract_with_gemini_pdf(pdf_bytes):
@@ -1911,7 +1919,16 @@ def _text_looks_thin(text):
     return False
 
 
+# ---------------------------------------------------------------------------
+# PDF title + summary extraction (FIX: works on RAW text with newlines)
+# ---------------------------------------------------------------------------
+
 def download_pdf_content(pdf_url, timeout=30):
+    """
+    Download + extract PDF text.
+
+    Returns a 4-tuple: (content_bytes, cleaned_text, ocr_used, method).
+    """
     global _RUNTIME_PDF_CACHE
     if pdf_url in _RUNTIME_PDF_CACHE:
         content = _RUNTIME_PDF_CACHE[pdf_url]
@@ -1920,32 +1937,32 @@ def download_pdf_content(pdf_url, timeout=30):
             session = make_session()
             content, actual_url, method = _download_with_pdf_resolution(session, pdf_url, timeout)
             if not content:
-                return None, "", False, method
+                return None, "", False, method, ""
             if len(content) > MAX_PDF_SEND_BYTES:
-                return None, "", False, "size_limit"
+                return None, "", False, "size_limit", ""
             _cache_put(pdf_url, content)
             if actual_url and actual_url != pdf_url:
                 _cache_put(actual_url, content)
         except Exception as exc:
             print(f"[WARN] PDF download failed for {pdf_url}: {exc}", file=sys.stderr)
-            return None, "", False, "download_error"
+            return None, "", False, "download_error", ""
 
-    text = _extract_pdf_text_plumber(content)
+    raw_text = _extract_pdf_text_plumber(content)
     extraction_method = "plumber"
 
-    if _text_looks_thin(text):
-        print(f"[INFO] PDF thin ({len(text)} chars). Trying Gemini PDF OCR...", file=sys.stderr)
+    if _text_looks_thin(raw_text):
+        print(f"[INFO] PDF thin ({len(raw_text)} chars). Trying Gemini PDF OCR...", file=sys.stderr)
         gemini_text = _extract_with_gemini_pdf(content)
-        if gemini_text and len(gemini_text.strip()) > len(text.strip()):
-            text = f"{text}\n\n--- GEMINI OCR ---\n\n{gemini_text}" if text.strip() else gemini_text
+        if gemini_text and len(gemini_text.strip()) > len(raw_text.strip()):
+            raw_text = f"{raw_text}\n\n--- GEMINI OCR ---\n\n{gemini_text}" if raw_text.strip() else gemini_text
             extraction_method = "gemini"
             print(f"[INFO] Gemini OCR succeeded ({len(gemini_text)} chars)", file=sys.stderr)
         else:
             if OCR_ENABLED and _RAPIDOCR_AVAILABLE:
                 print("[INFO] Gemini failed/skipped. Trying RapidOCR...", file=sys.stderr)
                 rocr_text = _extract_pdf_text_rapidocr(content)
-                if rocr_text and len(rocr_text.strip()) > len(text.strip()):
-                    text = f"{text}\n\n--- RAPIDOCR ---\n\n{rocr_text}" if text.strip() else rocr_text
+                if rocr_text and len(rocr_text.strip()) > len(raw_text.strip()):
+                    raw_text = f"{raw_text}\n\n--- RAPIDOCR ---\n\n{rocr_text}" if raw_text.strip() else rocr_text
                     extraction_method = "rapidocr"
                     print(f"[INFO] RapidOCR succeeded ({len(rocr_text)} chars)", file=sys.stderr)
                 else:
@@ -1953,7 +1970,7 @@ def download_pdf_content(pdf_url, timeout=30):
             else:
                 print("[INFO] RapidOCR disabled or unavailable", file=sys.stderr)
 
-    return (content, clean_text(text, MAX_PDF_TEXT_CHARS), extraction_method != "plumber", extraction_method)
+    return (content, clean_text(raw_text, MAX_PDF_TEXT_CHARS), extraction_method != "plumber", extraction_method)
 
 
 # ---------------------------------------------------------------------------
@@ -1961,6 +1978,12 @@ def download_pdf_content(pdf_url, timeout=30):
 # ---------------------------------------------------------------------------
 
 def keyword_fallback(items):
+    """
+    Fallback classification when Gemini is unavailable.
+
+    Summary is taken only from distinct website context. The website title
+    remains unchanged and is never reused as the summary.
+    """
     result = {}
     for index, item in enumerate(items):
         text = (f"{item.get('title', '')} {item.get('url', '')} "
@@ -1991,9 +2014,18 @@ def keyword_fallback(items):
             category = "announcement"
         elif "publication" in text:
             category = "publication"
+
+        title_text = (item.get("title") or "").strip()
+        ctx = (item.get("context") or "").strip()
+
+        summary = ""
+        if ctx and ctx.casefold() != title_text.casefold() and len(ctx) >= 20:
+            summary = ctx
+        # No distinct context? Keep summary empty rather than duplicate title.
+
         result[str(index)] = {
             "important": important, "category": category,
-            "summary": clean_text(item.get("title", ""), 180),
+            "summary": clean_text(summary, 180),
             "title_hi": None,
         }
     return result
@@ -3323,7 +3355,11 @@ def format_message(site, item, classification=None):
     title_is_hindi = _is_devanagari(raw_title)
     site_name = html.escape(site["name"])
     url = html.escape(item["url"], quote=True)
-    summary = html.escape(_safe_str(classification.get("summary")) or "")
+    summary_raw = _safe_str(classification.get("summary")) or ""
+    # Never repeat the title as a summary line.
+    if summary_raw.strip().lower() == raw_title.strip().lower():
+        summary_raw = ""
+    summary = html.escape(summary_raw)
     category = (classification.get("category") or "notice").lower()
     emoji = CATEGORY_EMOJI.get(category, "📌")
     ocr_method = item.get("pdf_method", "")
@@ -3425,6 +3461,7 @@ def prune_state(state, retention_days, max_items=3000, max_pending_attempts=72, 
             record.pop("pdf_extracted", None)
             record.pop("pdf_method", None)
             record.pop("ocr_used", None)
+            record.pop("pdf_summary_hint", None)
             if record.get("context"):
                 record["context"] = clean_text(record.get("context"), 300)
             stamp = record.get("terminal_at")
@@ -3539,7 +3576,7 @@ def prune_state(state, retention_days, max_items=3000, max_pending_attempts=72, 
             elif status == "pending" and isinstance(record.get("pdf_text"), str):
                 record["pdf_text"] = clean_text(record["pdf_text"], 1800)
             if isinstance(record.get("context"), str):
-                record["context"] = clean_text(record["context"], 350)
+                record["context"] = clean_text(record.get("context"), 350)
         if serialized_size() > max_bytes:
             active = []
             for key, record in items.items():
@@ -3631,8 +3668,10 @@ def _fetch_pdfs_for_batch(batch, scan):
                 content, text, ocr_used, method = fut.result()
             except Exception:
                 content, text, ocr_used, method = None, "", False, "error"
+
             record["pdf_attempts"] = int(record.get("pdf_attempts", 0)) + 1
             record["pdf_method"] = method
+
             if content:
                 try:
                     new_hash = _pdf_content_fingerprint(content)
@@ -3647,10 +3686,12 @@ def _fetch_pdfs_for_batch(batch, scan):
                     record["pdf_hash_kind"] = new_kind
                 except Exception as exc:
                     print(f"[WARN] PDF hash failed: {exc}", file=sys.stderr)
+
             if text:
                 record["pdf_text"] = text[:MAX_PDF_TEXT_CHARS]
                 record["pdf_extracted"] = True
                 record["ocr_used"] = bool(ocr_used)
+
                 if _is_stale_notice(
                     record.get("title", ""), record.get("context", ""), record.get("url", ""),
                     upload_date=_parse_upload_date(record.get("upload_date")), pdf_text=text,
@@ -3919,6 +3960,7 @@ def main():
                         record["pdf_attempts"] = 0
                         record["ocr_used"] = False
                         record["pdf_method"] = ""
+                        record.pop("pdf_summary_hint", None)
                         print(f"[RE-PROCESS] Existing notice metadata changed: {candidate['url'][:100]}")
                     if new_title:
                         record["title"] = new_title
@@ -4002,6 +4044,7 @@ def main():
                                 record["pdf_attempts"] = 0
                                 record["classification"] = None
                                 record["summary"] = ""
+                                record.pop("pdf_summary_hint", None)
                             if new_etag:
                                 record["etag"] = new_etag
                             if new_lm:
@@ -4022,6 +4065,7 @@ def main():
                         record["pdf_extracted"] = False
                         record["pdf_text"] = ""
                         record["pdf_attempts"] = 0
+                        record.pop("pdf_summary_hint", None)
                         print(f"[RE-PROCESS] Substantive baseline metadata change: {new_title[:80]}")
 
                 if candidate["title"]:
