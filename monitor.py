@@ -98,6 +98,11 @@ STRONG_KEYWORDS = [
     "सूचना", "नोटिस", "निविदा"
 ]
 
+# Devanagari digits (०-९) → ASCII (0-9) translation table.
+# NIC Hindi pages often write years as "२००२" instead of "2002";
+# the year-detection regex only understands ASCII digits.
+_DEVA_DIGIT_TRANS = str.maketrans("०१२३४५६७८९", "0123456789")
+
 _RUNTIME_PDF_CACHE: Dict[str, bytes] = {}
 _GEMINI_API_KEY = ""
 _GEMINI_KEYS_POOL: List[str] = []
@@ -587,6 +592,80 @@ _EMPTY_PAGE_PHRASES = [
 ]
 
 
+# Explicit document-title labels found on some NIC notice detail pages.
+_TITLE_LABEL_RE = re.compile(
+    r"^\s*(?:document\s+title|title|subject|शीर्षक|विषय|दस्तावेज़\s*शीर्षक)\s*[:：–—-]\s*$",
+    re.IGNORECASE,
+)
+_TITLE_INLINE_RE = re.compile(
+    r"^\s*(?:document\s+title|title|subject|शीर्षक|विषय|दस्तावेज़\s*शीर्षक)\s*[:：–—-]\s*(.+?)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _extract_explicit_title(soup):
+    """Extract a clearly labelled document title without changing link/ID titles."""
+    def clean_value(value):
+        value = clean_text(value or "", 500)
+        if len(value) < 15 or _is_generic_title(value) or _is_language_selector(value):
+            return ""
+        if _TITLE_LABEL_RE.match(value):
+            return ""
+        return value
+
+    # Labels and values sometimes appear together in one cell/line.
+    for node in soup.find_all(["td", "th", "dd", "p", "div", "li", "span"]):
+        text_value = clean_text(node.get_text(" ", strip=True), 600)
+        match = _TITLE_INLINE_RE.match(text_value)
+        if match:
+            value = clean_value(match.group(1))
+            if value:
+                return value
+
+    # Label/value tables: <tr><td>Title</td><td>...</td></tr>
+    for tr in soup.find_all("tr"):
+        cells = tr.find_all(["th", "td"], recursive=False)
+        if len(cells) >= 2:
+            label = clean_text(cells[0].get_text(" ", strip=True), 100)
+            if _TITLE_LABEL_RE.match(label + ":") or re.match(
+                r"^\s*(?:document\s+title|title|subject|शीर्षक|विषय|दस्तावेज़\s*शीर्षक)\s*$",
+                label, re.IGNORECASE,
+            ):
+                value = clean_value(cells[1].get_text(" ", strip=True))
+                if value:
+                    return value
+
+    # Definition lists: <dt>Title</dt><dd>...</dd>
+    for dt in soup.find_all("dt"):
+        label = clean_text(dt.get_text(" ", strip=True), 100)
+        if re.match(r"^\s*(?:document\s+title|title|subject|शीर्षक|विषय|दस्तावेज़\s*शीर्षक)\s*[:：]?\s*$", label, re.IGNORECASE):
+            dd = dt.find_next_sibling("dd")
+            if dd:
+                value = clean_value(dd.get_text(" ", strip=True))
+                if value:
+                    return value
+
+    # Label-like elements followed by a value in a sibling or parent container.
+    for label_node in soup.find_all(["b", "strong", "label"]):
+        label = clean_text(label_node.get_text(" ", strip=True), 100)
+        if not re.match(r"^\s*(?:document\s+title|title|subject|शीर्षक|विषय|दस्तावेज़\s*शीर्षक)\s*[:：]?\s*$", label, re.IGNORECASE):
+            continue
+        sibling = label_node.find_next_sibling()
+        if sibling:
+            value = clean_value(sibling.get_text(" ", strip=True))
+            if value:
+                return value
+        parent = label_node.parent
+        if parent:
+            combined = clean_text(parent.get_text(" ", strip=True), 700)
+            match = _TITLE_INLINE_RE.match(combined)
+            if match:
+                value = clean_value(match.group(1))
+                if value:
+                    return value
+    return ""
+
+
 def _is_navigation_url(url):
     try:
         parsed = urlparse(url)
@@ -617,9 +696,13 @@ def _is_generic_title(title):
         return True
     if t in _GENERIC_TITLES:
         return True
-    if t.isdigit() and len(t) <= 3:
+    # Treat icon-only and tiny anchor labels (for example "R", "🔍R", "PDF")
+    # as UI labels rather than meaningful notice titles. Unicode letters are
+    # preserved, so short Hindi text is evaluated consistently as well.
+    compact = re.sub(r"[^\w]+", "", t, flags=re.UNICODE)
+    if not compact or len(compact) <= 2:
         return True
-    if len(t) <= 2 and not any(c.isalnum() for c in t):
+    if t.isdigit() and len(t) <= 3:
         return True
     return False
 
@@ -1022,6 +1105,13 @@ def _extract_upload_date(anchor_tag):
 
 
 def _is_stale_notice(title, context, url, upload_date=None, pdf_text=None):
+    """Return True only when there is reasonable evidence a notice is stale.
+
+    Normalize Devanagari digits before year/date checks. The menu-dump guard is
+    deliberately conservative: a long title is rejected only when it also has
+    several navigation labels, avoiding false positives for legitimate Hindi
+    government-document titles.
+    """
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=STALE_NOTICE_DAYS)
     title_text = str(title or "")
@@ -1030,19 +1120,55 @@ def _is_stale_notice(title, context, url, upload_date=None, pdf_text=None):
     haystack = f"{title_text} {context_text} {url_text}".strip()
     full_text = f"{haystack} {pdf_text or ''}".strip()
 
-    title_years = [int(y) for y in re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", title_text)]
+    normalized_title = title_text.translate(_DEVA_DIGIT_TRANS)
+    normalized_context = context_text.translate(_DEVA_DIGIT_TRANS)
+    normalized_full = full_text.translate(_DEVA_DIGIT_TRANS)
+
+    # Reject obvious navigation/sidebar dumps, not merely long legitimate titles.
+    title_words = normalized_title.split()
+    if len(title_words) >= 8:
+        short_words = [word for word in title_words if len(word.strip("|•-–—,:;")) <= 6]
+        title_lower = normalized_title.lower()
+        nav_signals = (
+            "home", "homepage", "about us", "contact us", "contact", "feedback",
+            "site map", "sitemap", "skip to content", "accessibility", "screen reader",
+            "मुख्य पृष्ठ", "होम", "हमारे बारे में", "संपर्क करें", "संपर्क", "फीडबैक",
+            "साइट मैप", "स्क्रीन रीडर", "महत्वपूर्ण लिंक", "त्वरित लिंक",
+        )
+        notice_signals = (
+            "recruitment", "vacancy", "notification", "notice", "result",
+            "admit card", "tender", "corrigendum", "appointment", "selection",
+            "भर्ती", "नियुक्ति", "परिणाम", "निविदा", "शुद्धिपत्र", "चयन",
+            "आवेदन", "प्रवेश", "परीक्षा", "रिजल्ट", "सूचना", "नोटिस", "अधिसूचना",
+        )
+        nav_count = sum(1 for signal in nav_signals if signal in title_lower)
+        has_notice_signal = any(signal in title_lower for signal in notice_signals)
+        mostly_short = len(short_words) >= len(title_words) * 0.6
+        # At least two distinct navigation labels, or an explicit skip/site-map
+        # phrase, are required before classifying a title as a menu dump.
+        explicit_nav_dump = any(signal in title_lower for signal in (
+            "skip to content", "site map", "sitemap", "मुख्य पृष्ठ", "महत्वपूर्ण लिंक", "त्वरित लिंक"
+        ))
+        if mostly_short and not has_notice_signal and (nav_count >= 2 or explicit_nav_dump):
+            return True
+
+    # Prefer explicit issue dates and upload dates over incidental years in a PDF.
+    title_years = [int(year) for year in re.findall(
+        r"(?<!\d)(?:19|20)\d{2}(?!\d)", normalized_title
+    )]
     current_year = now.year
     current_year_update = bool(re.search(
-        rf"(?:revised|revision|corrigendum|addendum|amended|modified|संशोधित|शुद्धिपत्र).{{0,50}}{current_year}|{current_year}.{{0,50}}(?:revised|revision|corrigendum|addendum|amended|modified|संशोधित|शुद्धिपत्र)",
-        f"{title_text} {context_text}", re.I
+        rf"(?:revised|revision|corrigendum|addendum|amended|modified|संशोधित|शुद्धिपत्र).{{0,50}}{current_year}|"
+        rf"{current_year}.{{0,50}}(?:revised|revision|corrigendum|addendum|amended|modified|संशोधित|शुद्धिपत्र)",
+        f"{normalized_title} {normalized_context}", re.I
     ))
     title_has_old_range = len(title_years) >= 2 and max(title_years) < current_year
     title_has_very_old_year = bool(title_years) and max(title_years) < current_year - 1
     if (title_has_old_range or title_has_very_old_year) and not current_year_update:
         return True
 
-    issue_dates = _extract_explicit_issue_dates(full_text)
-    past_issue_dates = [d for d in issue_dates if d <= now]
+    issue_dates = _extract_explicit_issue_dates(normalized_full)
+    past_issue_dates = [date for date in issue_dates if date <= now]
     if past_issue_dates:
         return max(past_issue_dates) < cutoff
     if issue_dates:
@@ -1055,8 +1181,12 @@ def _is_stale_notice(title, context, url, upload_date=None, pdf_text=None):
             upload_date = upload_date.astimezone(timezone.utc)
         return upload_date < cutoff
 
-    years = [int(y) for y in re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", full_text)]
-    if years and max(years) < now.year:
+    # Last-resort year hint. Only use this when no explicit issue/upload date
+    # was found; a current-year update/corrigendum overrides an old year mention.
+    years = [int(year) for year in re.findall(
+        r"(?<!\d)(?:19|20)\d{2}(?!\d)", normalized_full
+    )]
+    if years and max(years) < current_year and not current_year_update:
         return True
     return False
 
@@ -1441,7 +1571,7 @@ def pending_priority(record, keywords, now=None):
     return score + age_bonus, age_days
 
 
-def item_id(site_id, url, title, context=""):
+def item_id(site_id, url, title="", context=""):
     fingerprint = hashlib.sha256(
         clean_text(f"{title}|{context}", 900).lower().encode()
     ).hexdigest()[:12]
@@ -1531,16 +1661,28 @@ def extract_candidates(html_text, page_url, site, scan):
             continue
         if _is_navigation_url(href):
             continue
-        title = clean_text(a.get_text(" ", strip=True), 300)
-        if _is_generic_title(title):
-            continue
 
+        # Inspect surrounding row/container BEFORE rejecting a blank/generic
+        # anchor. Some NIC pages use an icon or a single letter as link text.
+        title = clean_text(a.get_text(" ", strip=True), 300)
         parent = a.find_parent("tr")
         if parent is None:
             parent = a.find_parent(["li", "article", "section"])
         if parent is None:
             parent = a.find_parent(["div", "td"])
         context = clean_text(parent.get_text(" ", strip=True) if parent else "", 700)
+
+        if _is_generic_title(title) or _is_language_selector(title):
+            context_parts = re.split(r"[|\n\r\t]+", context)
+            context_title = ""
+            for part in context_parts:
+                part = clean_text(part, 200)
+                if len(part) >= 8 and not _is_generic_title(part) and not _is_language_selector(part):
+                    context_title = part
+                    break
+            title = context_title or _title_from_url(href, min_len=5) or ""
+            if not title or _is_generic_title(title):
+                continue
 
         if _is_language_selector(title):
             parent_text = clean_text(parent.get_text(" ", strip=True) if parent else "", 300)
@@ -1594,9 +1736,18 @@ def extract_candidates(html_text, page_url, site, scan):
 
         is_pdf_or_notice = bool(pdf_bonus > 0)
 
+        # Final non-empty title guard; avoid emitting whitespace-only titles.
+        final_title = clean_text(title, 300)
+        if not final_title or _is_generic_title(final_title):
+            final_title = clean_text(context, 180)
+        if not final_title or _is_generic_title(final_title):
+            final_title = _title_from_url(href, min_len=5)
+        if not final_title:
+            final_title = "Notice"
+
         out.append({
             "url": href,
-            "title": title or clean_text(context, 180) or href.rsplit("/", 1)[-1],
+            "title": final_title,
             "context": context,
             "source_page": page_url,
             "is_pdf": is_pdf_or_notice,
@@ -1604,7 +1755,15 @@ def extract_candidates(html_text, page_url, site, scan):
             "upload_date": upload_dt.isoformat() if upload_dt else None,
         })
     out.sort(key=lambda x: (-x["score"], x["title"].lower()))
-    return out[: scan["max_items_per_site"]]
+    out = out[: scan["max_items_per_site"]]
+    # Only attach the page's explicit title when there is exactly one candidate.
+    # Keep candidate["title"] unchanged so item IDs, matching, and stale checks
+    # continue to use the original link-derived metadata.
+    if len(out) == 1:
+        explicit_title = _extract_explicit_title(soup)
+        if explicit_title:
+            out[0]["explicit_title"] = explicit_title
+    return out
 
 
 def discover_from_sitemap(session, base_url, scan):
@@ -3344,13 +3503,14 @@ _FORMATTERS = {
 
 def format_message(site, item, classification=None):
     classification = classification or {}
-    raw_title = clean_text(item.get("title", "Notification"), 300)
-    if _is_language_selector(raw_title):
+    raw_title = clean_text(item.get("explicit_title") or item.get("title") or "", 300)
+    if not raw_title or _is_generic_title(raw_title) or _is_language_selector(raw_title):
         raw_title = (
-            clean_text(item.get("context", ""), 200)
-            or _title_from_url(item.get("url", ""))
-            or "Notification"
+            clean_text(item.get("context") or "", 200)
+            or _title_from_url(item.get("url", ""), min_len=5)
+            or "Notice"
         )
+    raw_title = clean_text(raw_title, 300) or "Notice"
     title_hi = _safe_str(classification.get("title_hi"), 200)
     title_is_hindi = _is_devanagari(raw_title)
     site_name = html.escape(site["name"])
@@ -3861,6 +4021,7 @@ def main():
                 state["items"].setdefault(iid, {
                     "site_id": sid, "site_name": site["name"],
                     "url": candidate["url"], "title": candidate["title"],
+                    "explicit_title": candidate.get("explicit_title", ""),
                     "context": candidate.get("context", "")[:700],
                     "is_pdf": bool(candidate.get("is_pdf")),
                     "first_seen": utc_now(), "last_seen": utc_now(),
@@ -3948,7 +4109,13 @@ def main():
                         old_title, new_title, old_context, new_context
                     )
                     record["last_seen"] = utc_now()
-                    if metadata_changed and record.get("status") in {"sent", "ignored", "baseline"}:
+                    # A metadata-only change must never revert a successfully
+                    # sent notice to pending. NIC pages often rewrite link text
+                    # or surrounding context without publishing a new notice.
+                    # Keep sent state stable; allow ignored/baseline items to be
+                    # reconsidered only when a meaningful change was detected.
+                    current_status = record.get("status")
+                    if metadata_changed and current_status in {"ignored", "baseline"}:
                         record["status"] = "pending"
                         record.pop("terminal_at", None)
                         record["attempts"] = 0
@@ -3961,9 +4128,13 @@ def main():
                         record["ocr_used"] = False
                         record["pdf_method"] = ""
                         record.pop("pdf_summary_hint", None)
-                        print(f"[RE-PROCESS] Existing notice metadata changed: {candidate['url'][:100]}")
+                        print(f"[RE-PROCESS] Ignored/baseline notice meaningfully changed: {candidate['url'][:100]}")
+                    elif metadata_changed and current_status == "sent":
+                        print(f"[SKIP-RE-PROCESS] Already sent; metadata-only change ignored: {candidate['url'][:100]}")
                     if new_title:
                         record["title"] = new_title
+                    if candidate.get("explicit_title"):
+                        record["explicit_title"] = candidate["explicit_title"]
                     if new_context:
                         record["context"] = new_context
                     if candidate.get("upload_date"):
@@ -3998,6 +4169,7 @@ def main():
                 record = {
                     "site_id": sid, "site_name": site["name"],
                     "url": candidate["url"], "title": candidate["title"],
+                    "explicit_title": candidate.get("explicit_title", ""),
                     "context": candidate.get("context", "")[:700],
                     "is_pdf": is_pdf_or_notice,
                     "first_seen": utc_now(), "last_seen": utc_now(),
@@ -4070,6 +4242,8 @@ def main():
 
                 if candidate["title"]:
                     record["title"] = candidate["title"]
+                if candidate.get("explicit_title"):
+                    record["explicit_title"] = candidate["explicit_title"]
                 if candidate.get("context"):
                     record["context"] = candidate["context"][:700]
                 if candidate.get("upload_date"):
@@ -4155,6 +4329,7 @@ def main():
         (iid, record)
         for iid, record in state["items"].items()
         if record.get("status") == "ready"
+        and not record.get("sent_once", False)
         and int(record.get("telegram_attempts", 0) or 0) < TELEGRAM_MAX_ATTEMPTS
         and _telegram_retry_due(record)
     ]
@@ -4187,6 +4362,8 @@ def main():
         if ok:
             state["metrics"]["sent_notifications"] = int(state["metrics"].get("sent_notifications", 0)) + 1
             record["status"] = "sent"
+            record["sent_once"] = True
+            record["notified_at"] = utc_now()
             record["last_error"] = None
             record.pop("telegram_next_attempt_at", None)
             record.pop("telegram_first_failed_at", None)
