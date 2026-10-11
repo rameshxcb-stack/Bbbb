@@ -2,7 +2,7 @@ name: Jharkhand District Notification Monitor
 
 on:
   schedule:
-    - cron: "*/40 * * * *"
+    - cron: "*/20 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -15,7 +15,7 @@ concurrency:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
 
     steps:
       - name: Checkout code
