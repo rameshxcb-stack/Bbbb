@@ -2,7 +2,7 @@ name: Jharkhand District Notification Monitor
 
 on:
   schedule:
-    - cron: "*/20 * * * *"
+    - cron: "*/40 * * * *"
   workflow_dispatch:
 
 permissions:
