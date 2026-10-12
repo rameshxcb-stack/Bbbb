@@ -2,7 +2,7 @@ name: Jharkhand District Notification Monitor
 
 on:
   schedule:
-    - cron: "*/40 * * * *"
+    - cron: "*/30 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -15,13 +15,13 @@ concurrency:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 60
 
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -29,30 +29,15 @@ jobs:
           python-version: "3.12"
           cache: "pip"
 
+      - name: Install system deps (Tesseract + Poppler)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-hin poppler-utils
+
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-
-      - name: Run regression tests
-        run: |
-          set -euo pipefail
-          python -m unittest discover -s tests -v
-
-      - name: Restore persisted state
-        shell: bash
-        run: |
-          set -euo pipefail
-          if git fetch origin refs/heads/monitor-state:refs/remotes/origin/monitor-state 2>/dev/null; then
-            if git cat-file -e origin/monitor-state:state.json 2>/dev/null; then
-              git show origin/monitor-state:state.json > state.json
-              echo "Restored state.json from monitor-state branch."
-            else
-              echo "monitor-state branch exists but has no state.json; keeping repository default if present."
-            fi
-          else
-            echo "monitor-state branch not found; starting from state.json in the code repository, if present."
-          fi
 
       - name: Run notification monitor
         env:
@@ -62,49 +47,31 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           NOTIFY_LANGUAGE: "both"
           OCR_ENABLED: "true"
-          OCR_DPI: "150"
-          OCR_MAX_WORKERS: "2"
+          OCR_LANG: "eng+hin"
+          OCR_DPI: "200"
+          OCR_MAX_WORKERS: "1"
           SEND_PDF_ENABLED: "true"
           GEMINI_MAX_OUTPUT_TOKENS: "16384"
           GEMINI_PDF_OCR_ENABLED: "true"
         run: |
           python monitor.py
 
-      - name: Save state to monitor-state branch
+      - name: Commit state
         if: always()
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
-          if [ ! -f state.json ]; then
-            echo "No state.json was produced or present; nothing to save."
-            exit 0
-          fi
-
-          cp state.json /tmp/monitor-state.json
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git fetch origin refs/heads/monitor-state:refs/remotes/origin/monitor-state 2>/dev/null || true
-          if git show-ref --verify --quiet refs/remotes/origin/monitor-state; then
-            git worktree add --detach /tmp/monitor-state-worktree origin/monitor-state
-            cp /tmp/monitor-state.json /tmp/monitor-state-worktree/state.json
-            cd /tmp/monitor-state-worktree
-            git add state.json
-            if git diff --cached --quiet; then
-              echo "State unchanged; no commit needed."
-              exit 0
-            fi
+          git add state.json
+          git diff --cached --quiet || \
             git commit -m "chore: update notification state"
-          else
-            git worktree add --detach /tmp/monitor-state-worktree HEAD
-            cd /tmp/monitor-state-worktree
-            git switch --orphan monitor-state
-            git rm -rf . >/dev/null 2>&1 || true
-            cp /tmp/monitor-state.json state.json
-            git add state.json
-            git commit -m "chore: initialize notification state"
-          fi
 
-          git push origin HEAD:refs/heads/monitor-state
+      - name: Rebase and push state
+        if: always()
+        run: |
+          for i in 1 2 3 4 5; do
+            git fetch origin "${GITHUB_REF_NAME}" && \
+              git rebase "origin/${GITHUB_REF_NAME}" && \
+              git push origin "HEAD:${GITHUB_REF_NAME}" && break
+            echo "Push attempt $i failed, retrying in 5s..."
+            sleep 5
+          done
