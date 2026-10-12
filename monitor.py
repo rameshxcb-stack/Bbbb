@@ -37,6 +37,11 @@ except ImportError:
     _RAPIDOCR_AVAILABLE = False
 
 
+# Reliability note:
+# No scanner can guarantee 99.99% notice recall or 100% duplicate detection
+# without measured production coverage and source-level identity data. This
+# version favors durable queue recovery and conservative title matching.
+
 BASE = Path(__file__).resolve().parent
 CONFIG_FILE = BASE / "websites.json"
 STATE_FILE = BASE / "state.json"
@@ -49,7 +54,7 @@ FALLBACK_MODELS = [
 FUZZY_DUPLICATE_THRESHOLD = 94
 FUZZY_CROSS_PATH_THRESHOLD = 96
 TELEGRAM_MAX_ATTEMPTS = 100
-TELEGRAM_RETRY_WINDOW_HOURS = 72
+TELEGRAM_RETRY_WINDOW_HOURS = 168  # Keep transient Telegram failures retryable for 7 days
 TELEGRAM_RETRY_BASE_MINUTES = 20
 TELEGRAM_RETRY_MAX_MINUTES = 360
 
@@ -85,7 +90,7 @@ ETAG_CHECK_MAX_AGE_DAYS = int(os.getenv("ETAG_CHECK_MAX_AGE_DAYS", "14"))
 
 USER_AGENT = os.getenv(
     "MONITOR_USER_AGENT",
-    "Mozilla/5.0 (compatible; JharkhandNoticeMonitor/9.3)"
+    "Mozilla/5.0 (compatible; JharkhandNoticeMonitor/9.4)"
 )
 
 STRONG_KEYWORDS = [
@@ -97,7 +102,6 @@ STRONG_KEYWORDS = [
     "सूचना", "नोटिस", "निविदा"
 ]
 
-# Devanagari digits (०-९) → ASCII (0-9) translation table.
 _DEVA_DIGIT_TRANS = str.maketrans("०१२३४५६७८९", "0123456789")
 
 _RUNTIME_PDF_CACHE: Dict[str, bytes] = {}
@@ -114,6 +118,294 @@ _GEMINI_QUOTA_EXHAUSTED: bool = False
 
 _RAPIDOCR_INSTANCE = None
 _ROBOTS_CACHE = {}
+
+
+# ---------------------------------------------------------------------------
+# Nav / Notice signal sets
+# ---------------------------------------------------------------------------
+_NAV_SIGNALS: Tuple[str, ...] = (
+    "home", "homepage", "about us", "about", "contact us", "contact",
+    "feedback", "site map", "sitemap", "skip to content",
+    "accessibility", "screen reader",
+    "whats new", "what's new", "whatsnew", "latest news", "latest update",
+    "latest updates", "photo gallery", "video gallery", "gallery",
+    "facebook", "twitter", "instagram", "youtube", "whatsapp", "linkedin",
+    "social media", "follow us", "share",
+    "login", "sign in", "sign up", "register", "logout",
+    "main menu", "menu", "navigation",
+    "मुख्य पृष्ठ", "होम", "हमारे बारे में", "संपर्क करें", "संपर्क",
+    "फीडबैक", "साइट मैप", "स्क्रीन रीडर", "महत्वपूर्ण लिंक", "त्वरित लिंक",
+    "नई खबरें", "ताज़ा खबर", "अंतिम अपडेट", "गैलरी", "फोटो गैलरी",
+)
+
+_NOTICE_SIGNALS: Tuple[str, ...] = (
+    "recruitment", "vacancy", "notification", "notice", "result",
+    "admit card", "tender", "corrigendum", "appointment", "selection",
+    "भर्ती", "नियुक्ति", "परिणाम", "निविदा", "शुद्धिपत्र", "चयन",
+    "आवेदन", "प्रवेश", "परीक्षा", "रिजल्ट", "सूचना", "नोटिस", "अधिसूचना",
+)
+
+_EXPLICIT_DUMP_SIGNALS: Tuple[str, ...] = (
+    "skip to content", "site map", "sitemap",
+    "मुख्य पृष्ठ", "महत्वपूर्ण लिंक", "त्वरित लिंक",
+)
+
+# High-confidence signals used only for the early-title menu-dump check.
+_STRICT_EARLY_NAV_SIGNALS: Tuple[str, ...] = (
+    "home", "homepage", "whats new", "what's new", "whatsnew",
+    "facebook", "twitter", "instagram", "youtube", "whatsapp",
+    "linkedin", "skip to content", "sitemap", "site map",
+    "मुख्य पृष्ठ", "होम", "साइट मैप",
+)
+
+_DEVANAGARI_DELIMS = r"[\s\|•\-–—,:;()\[\]{}/\\?!\"'`]"
+_LATIN_LEFT_BOUNDARY = r"(?<![A-Za-z0-9_])"
+_LATIN_RIGHT_BOUNDARY = r"(?![A-Za-z0-9_])"
+
+# Signals we want to strip when cleaning a menu-dump title prefix.
+# Ordered roughly by length so longer signals eat their chars first.
+_TITLE_STRIP_SIGNALS: Tuple[str, ...] = tuple(
+    sorted(_STRICT_EARLY_NAV_SIGNALS, key=len, reverse=True)
+)
+
+
+def _is_devanagari_str(text: str) -> bool:
+    return any("\u0900" <= c <= "\u097F" for c in (text or ""))
+
+
+def _match_signal(text: str, signal: str) -> bool:
+    if not text or not signal:
+        return False
+    sig = signal.strip().lower()
+    if not sig:
+        return False
+    lower = text.lower()
+    if _is_devanagari_str(sig):
+        pattern = (
+            r"(?:^|" + _DEVANAGARI_DELIMS + r")"
+            + re.escape(sig)
+            + r"(?:$|" + _DEVANAGARI_DELIMS + r")"
+        )
+    else:
+        pattern = _LATIN_LEFT_BOUNDARY + re.escape(sig) + _LATIN_RIGHT_BOUNDARY
+    return bool(re.search(pattern, lower))
+
+
+def _count_nav_signals(text: str) -> int:
+    if not text:
+        return 0
+    remaining = text.lower()
+    matched = 0
+    for sig in sorted(_NAV_SIGNALS, key=len, reverse=True):
+        sig_lower = sig.strip().lower()
+        if not sig_lower:
+            continue
+        if _is_devanagari_str(sig_lower):
+            pattern = (
+                r"(?:^|" + _DEVANAGARI_DELIMS + r")"
+                + re.escape(sig_lower)
+                + r"(?:$|" + _DEVANAGARI_DELIMS + r")"
+            )
+        else:
+            pattern = _LATIN_LEFT_BOUNDARY + re.escape(sig_lower) + _LATIN_RIGHT_BOUNDARY
+        new_remaining, n = re.subn(pattern, " ", remaining)
+        if n > 0:
+            matched += 1
+            remaining = new_remaining
+    return matched
+
+
+# ---------------------------------------------------------------------------
+# Menu-dump detection & title cleanup
+# ---------------------------------------------------------------------------
+
+_NOTICE_DOC_URL_HINTS = (
+    "/writereaddata/", "/uploadfile/", "/uploads/",
+    "/downloadfile", "/download_file", "/getfile",
+    "/showfile", "/viewfile", "/filedownload",
+    "/attachment", "/documents/", "/docs/",
+    "/notice/", "/notice_", "/download/",
+)
+
+
+def _is_notice_document_url(url):
+    """True if the URL clearly points to a notice document (PDF / download)."""
+    if not url:
+        return False
+    u = url.lower()
+    if u.endswith(".pdf") or ".pdf?" in u:
+        return True
+    if _looks_like_pdf_url(url):
+        return True
+    try:
+        path = (urlparse(url).path or "").lower()
+    except Exception:
+        return False
+    return any(hint in path for hint in _NOTICE_DOC_URL_HINTS)
+
+
+def _looks_like_menu_dump(title):
+    """True if the title begins with a run of high-confidence nav signals."""
+    if not title:
+        return False
+    words = title.split()
+    if len(words) < 4:
+        return False
+    first_words = " ".join(words[:8]).lower()
+    count = sum(1 for sig in _STRICT_EARLY_NAV_SIGNALS
+                if _match_signal(first_words, sig))
+    return count >= 2
+
+
+def _is_garbage_title(title):
+    """Detect titles that are pure noise (no meaningful content)."""
+    if not title:
+        return True
+    t = title.strip()
+    if not t:
+        return True
+    stripped = re.sub(r"^[\s\|•\-–—,:;.]+|[\s\|•\-–—,:;.]+$", "", t)
+    if not stripped or len(stripped) < 4:
+        return True
+    if re.match(r"^[\d\s/\-.:()\[\]|,]+$", stripped):
+        return True
+    if _is_generic_title(stripped):
+        return True
+    if _is_language_selector(stripped):
+        return True
+    return False
+
+
+def _filename_to_title(url):
+    """Extract a human-readable title from a document URL's filename."""
+    try:
+        path = unquote(urlparse(url).path or "")
+        name = path.rstrip("/").rsplit("/", 1)[-1]
+        if not name:
+            return ""
+        if "." in name:
+            name = name.rsplit(".", 1)[0]
+        name = re.sub(r"[_\-]+", " ", name)
+        name = re.sub(
+            r"^(pdf|doc|docx|file|download|notice|document|scan|img|image)\s+",
+            "", name, flags=re.I,
+        )
+        name = re.sub(r"\s+", " ", name).strip()
+        if len(name) < 10 or _is_generic_title(name):
+            return ""
+        if re.match(r"^[\d\s/\-.:()\[\]]+$", name):
+            return ""
+        return clean_text(name, 300)
+    except Exception:
+        return ""
+
+
+def _strip_nav_prefix(title):
+    """Remove a leading run of nav signals + common row noise."""
+    if not title:
+        return title
+    scan_region = title[:400]
+    last_end = 0
+    for sig in _TITLE_STRIP_SIGNALS:
+        sig_lower = sig.lower()
+        if _is_devanagari_str(sig_lower):
+            pattern = re.compile(
+                r"(?:^|" + _DEVANAGARI_DELIMS + r")"
+                + re.escape(sig_lower)
+                + r"(?:$|" + _DEVANAGARI_DELIMS + r")"
+            )
+        else:
+            pattern = re.compile(
+                _LATIN_LEFT_BOUNDARY + re.escape(sig_lower) + _LATIN_RIGHT_BOUNDARY
+            )
+        for m in pattern.finditer(scan_region.lower()):
+            if m.end() > last_end:
+                last_end = m.end()
+    if last_end <= 0:
+        return title
+    rest = title[last_end:].lstrip(" \t:-–—|•,;")
+    # Strip a leading date token: "08.10.2026: ..." → "..."
+    rest = re.sub(r"^\d{1,2}[./\-]\d{1,2}[./\-]\d{4}[\s:;\-–—]+", "", rest)
+    # Cut off at row-metadata tails
+    for marker in (
+        r"\bPublished\s+on\s*:",
+        r"\bPosted\s+on\s*:",
+        r"\bUploaded\s+on\s*:",
+        r"\bDate\s+of\s+Publication\s*:",
+        r"\bप्रकाशित\s*:",
+    ):
+        m = re.search(marker, rest, re.I)
+        if m and m.start() >= 15:
+            rest = rest[:m.start()].rstrip(" .;,-")
+    rest = rest.strip()
+    return rest if len(rest) >= 15 else title
+
+
+def _cleanup_menu_dump_title(title, url="", explicit=""):
+    """Best-effort clean title from a menu-dump / garbage title."""
+    if explicit and not _is_generic_title(explicit) \
+            and not _is_language_selector(explicit) \
+            and not _looks_like_menu_dump(explicit) \
+            and not _is_garbage_title(explicit):
+        return clean_text(explicit, 300)
+    if url and _is_notice_document_url(url):
+        name = _filename_to_title(url)
+        if name:
+            return name
+    if title:
+        stripped = _strip_nav_prefix(title)
+        if stripped and stripped != title and len(stripped) >= 15:
+            return clean_text(stripped, 300)
+    if url:
+        slug = _title_from_url(url, min_len=8)
+        if slug:
+            return slug
+    return title
+
+
+def _resolve_title(item):
+    """Resolve the best title for an item, applying cleanup as needed.
+
+    Priority:
+      1. explicit_title (structured 'Title:' field on NIC pages)
+      2. clean anchor title
+      3. cleaned-up menu-dump / garbage title (filename / nav-strip / slug)
+      4. context
+      5. URL slug
+      6. literal "Notice"
+    """
+    explicit = clean_text(item.get("explicit_title") or "", 300)
+    anchor = clean_text(item.get("title") or "", 300)
+    context = clean_text(item.get("context") or "", 200)
+    url = item.get("url", "")
+
+    def _ok(v):
+        return (v and not _is_generic_title(v)
+                and not _is_language_selector(v)
+                and not _looks_like_menu_dump(v)
+                and not _is_garbage_title(v))
+
+    if _ok(explicit):
+        return explicit
+    if _ok(anchor):
+        return anchor
+
+    for candidate in (explicit, anchor):
+        if candidate and (_looks_like_menu_dump(candidate) or _is_garbage_title(candidate)):
+            cleaned = _cleanup_menu_dump_title(candidate, url=url, explicit="")
+            if cleaned and cleaned != candidate and _ok(cleaned):
+                return cleaned
+
+    if context and not _is_generic_title(context) \
+            and not _is_language_selector(context) \
+            and not _looks_like_menu_dump(context):
+        return context[:200]
+
+    slug = _title_from_url(url, min_len=5)
+    if slug:
+        return slug
+
+    return "Notice"
 
 
 def _get_rapidocr():
@@ -586,7 +878,6 @@ _EMPTY_PAGE_PHRASES = [
 ]
 
 
-# Explicit document-title labels found on some NIC notice detail pages.
 _TITLE_LABEL_RE = re.compile(
     r"^\s*(?:document\s+title|title|subject|शीर्षक|विषय|दस्तावेज़\s*शीर्षक)\s*[:：–—-]\s*$",
     re.IGNORECASE,
@@ -595,13 +886,21 @@ _TITLE_INLINE_RE = re.compile(
     r"^\s*(?:document\s+title|title|subject|शीर्षक|विषय|दस्तावेज़\s*शीर्षक)\s*[:：–—-]\s*(.+?)\s*$",
     re.IGNORECASE,
 )
+_TITLE_LABEL_STRICT_RE = re.compile(
+    r"^\s*(?:document\s+title|title|subject|शीर्षक|विषय|दस्तावेज़\s*शीर्षक)"
+    r"\s*[:：–—-]?\s*$",
+    re.IGNORECASE,
+)
 
 
 def _extract_explicit_title(soup):
     """Extract a clearly labelled document title without changing link/ID titles.
 
-    Handles both `<td>Title</td><td>...</td>` and `<td>Title:</td><td>...</td>`
-    by treating the colon/dash as optional.
+    Order of preference (table-based first — most reliable on NIC pages):
+      1. <tr><th>Title:</th><td>value</td></tr>
+      2. <dt>Title</dt><dd>value</dd>
+      3. <b>/<strong>/<label>Title:</b> sibling or parent
+      4. Inline "Title: value" as the ONLY text of a leaf node
     """
     def clean_value(value):
         value = clean_text(value or "", 500)
@@ -609,41 +908,34 @@ def _extract_explicit_title(soup):
             return ""
         if _TITLE_LABEL_RE.match(value):
             return ""
+        if _looks_like_menu_dump(value):
+            return ""
         return value
 
-    for node in soup.find_all(["td", "th", "dd", "p", "div", "li", "span"]):
-        text_value = clean_text(node.get_text(" ", strip=True), 600)
-        match = _TITLE_INLINE_RE.match(text_value)
-        if match:
-            value = clean_value(match.group(1))
-            if value:
-                return value
-
+    # 1. Table row based
     for tr in soup.find_all("tr"):
         cells = tr.find_all(["th", "td"], recursive=False)
         if len(cells) >= 2:
             label = clean_text(cells[0].get_text(" ", strip=True), 100)
-            if re.match(
-                r"^\s*(?:document\s+title|title|subject|शीर्षक|विषय|दस्तावेज़\s*शीर्षक)"
-                r"\s*[:：–—-]?\s*$",
-                label, re.IGNORECASE,
-            ):
+            if _TITLE_LABEL_STRICT_RE.match(label):
                 value = clean_value(cells[1].get_text(" ", strip=True))
                 if value:
                     return value
 
+    # 2. <dt> + <dd>
     for dt in soup.find_all("dt"):
         label = clean_text(dt.get_text(" ", strip=True), 100)
-        if re.match(r"^\s*(?:document\s+title|title|subject|शीर्षक|विषय|दस्तावेज़\s*शीर्षक)\s*[:：]?\s*$", label, re.IGNORECASE):
+        if _TITLE_LABEL_STRICT_RE.match(label):
             dd = dt.find_next_sibling("dd")
             if dd:
                 value = clean_value(dd.get_text(" ", strip=True))
                 if value:
                     return value
 
+    # 3. <b>/<strong>/<label> + sibling, or inline inside parent
     for label_node in soup.find_all(["b", "strong", "label"]):
         label = clean_text(label_node.get_text(" ", strip=True), 100)
-        if not re.match(r"^\s*(?:document\s+title|title|subject|शीर्षक|विषय|दस्तावेज़\s*शीर्षक)\s*[:：]?\s*$", label, re.IGNORECASE):
+        if not _TITLE_LABEL_STRICT_RE.match(label):
             continue
         sibling = label_node.find_next_sibling()
         if sibling:
@@ -653,11 +945,24 @@ def _extract_explicit_title(soup):
         parent = label_node.parent
         if parent:
             combined = clean_text(parent.get_text(" ", strip=True), 700)
-            match = _TITLE_INLINE_RE.match(combined)
-            if match:
-                value = clean_value(match.group(1))
+            m = _TITLE_INLINE_RE.match(combined)
+            if m:
+                value = clean_value(m.group(1))
                 if value:
                     return value
+
+    # 4. Inline regex on leaf-ish nodes (last resort, guarded)
+    for node in soup.find_all(["td", "th", "dd", "p", "div", "li", "span"]):
+        raw = node.get_text(" ", strip=True)
+        if len(raw) > 700:
+            continue
+        text_value = clean_text(raw, 700)
+        m = _TITLE_INLINE_RE.match(text_value)
+        if m:
+            value = clean_value(m.group(1))
+            if value:
+                return value
+
     return ""
 
 
@@ -1110,30 +1415,45 @@ def _is_stale_notice(title, context, url, upload_date=None, pdf_text=None):
     normalized_context = context_text.translate(_DEVA_DIGIT_TRANS)
     normalized_full = full_text.translate(_DEVA_DIGIT_TRANS)
 
+    # ---- Menu-dump heuristic ------------------------------------------------
+    # If the first ~6 words of the title are dominated by high-confidence
+    # nav signals, treat the title as a menu dump — BUT ONLY for non-document
+    # URLs. Document URLs (PDF / writereaddata / downloadfile ...) are kept
+    # so their title can be cleaned up downstream.
     title_words = normalized_title.split()
-    if len(title_words) >= 8:
-        short_words = [word for word in title_words if len(word.strip("|•-–—,:;")) <= 6]
+    if len(title_words) >= 5:
+        first_words = " ".join(title_words[:6]).lower()
+        early_nav_count = sum(
+            1 for sig in _STRICT_EARLY_NAV_SIGNALS
+            if _match_signal(first_words, sig)
+        )
+        if early_nav_count >= 2:
+            if not _is_notice_document_url(url):
+                print(
+                    f"[MENU-DUMP-SKIP] early-nav={early_nav_count}: "
+                    f"{normalized_title[:120]}",
+                    file=sys.stderr,
+                )
+                return True
+
+        # Fall back to the old heuristic for titles where nav signals
+        # appear later (still only rejects non-document URLs).
+        short_words = [w for w in title_words if len(w.strip("|•-–—,:;")) <= 6]
         title_lower = normalized_title.lower()
-        nav_signals = (
-            "home", "homepage", "about us", "contact us", "contact", "feedback",
-            "site map", "sitemap", "skip to content", "accessibility", "screen reader",
-            "मुख्य पृष्ठ", "होम", "हमारे बारे में", "संपर्क करें", "संपर्क", "फीडबैक",
-            "साइट मैप", "स्क्रीन रीडर", "महत्वपूर्ण लिंक", "त्वरित लिंक",
+        nav_count = _count_nav_signals(title_lower)
+        has_notice_signal = any(
+            _match_signal(title_lower, sig) for sig in _NOTICE_SIGNALS
         )
-        notice_signals = (
-            "recruitment", "vacancy", "notification", "notice", "result",
-            "admit card", "tender", "corrigendum", "appointment", "selection",
-            "भर्ती", "नियुक्ति", "परिणाम", "निविदा", "शुद्धिपत्र", "चयन",
-            "आवेदन", "प्रवेश", "परीक्षा", "रिजल्ट", "सूचना", "नोटिस", "अधिसूचना",
-        )
-        nav_count = sum(1 for signal in nav_signals if signal in title_lower)
-        has_notice_signal = any(signal in title_lower for signal in notice_signals)
         mostly_short = len(short_words) >= len(title_words) * 0.6
-        explicit_nav_dump = any(signal in title_lower for signal in (
-            "skip to content", "site map", "sitemap", "मुख्य पृष्ठ", "महत्वपूर्ण लिंक", "त्वरित लिंक"
-        ))
-        if mostly_short and not has_notice_signal and (nav_count >= 2 or explicit_nav_dump):
-            return True
+        explicit_nav_dump = any(
+            _match_signal(title_lower, sig) for sig in _EXPLICIT_DUMP_SIGNALS
+        )
+        compact_social_dump = (
+            len(title_words) <= 8 and nav_count >= 3 and not has_notice_signal
+        )
+        if not has_notice_signal and not _is_notice_document_url(url):
+            if (mostly_short and (nav_count >= 2 or explicit_nav_dump)) or compact_social_dump:
+                return True
 
     title_years = [int(year) for year in re.findall(
         r"(?<!\d)(?:19|20)\d{2}(?!\d)", normalized_title
@@ -1169,6 +1489,17 @@ def _is_stale_notice(title, context, url, upload_date=None, pdf_text=None):
     if years and max(years) < current_year and not current_year_update:
         return True
     return False
+
+
+def _classify_stale_reason(title, context, url, upload_date=None, pdf_text=None):
+    if not _is_stale_notice(title, context, url, upload_date=upload_date, pdf_text=pdf_text):
+        return None
+    title_lower = str(title or "").lower()
+    nav_count = _count_nav_signals(title_lower)
+    has_notice_signal = any(_match_signal(title_lower, sig) for sig in _NOTICE_SIGNALS)
+    if nav_count >= 2 and not has_notice_signal:
+        return f"MENU-DUMP(nav={nav_count})"
+    return "STALE"
 
 
 # ---------------------------------------------------------------------------
@@ -1302,7 +1633,7 @@ def get_config():
         "domain_delay_seconds": 1.0,
         "max_state_items": 3000,
         "max_state_bytes": 3000000,
-        "max_pending_attempts": 72,
+        "max_pending_attempts": 500,
         "stale_notice_days": 10,
         "site_alert_threshold": 3,
         "site_alert_cooldown_hours": 6,
@@ -1329,7 +1660,7 @@ def get_config():
     scan["domain_delay_seconds"] = max(0.0, min(10.0, float(scan["domain_delay_seconds"])))
     scan["max_state_items"] = max(500, min(10000, int(scan["max_state_items"])))
     scan["max_state_bytes"] = max(500000, min(3000000, int(scan["max_state_bytes"])))
-    scan["max_pending_attempts"] = max(1, int(scan["max_pending_attempts"]))
+    scan["max_pending_attempts"] = max(500, int(scan["max_pending_attempts"]))
     scan["stale_notice_days"] = max(1, int(scan["stale_notice_days"]))
     scan["site_alert_threshold"] = max(1, int(scan["site_alert_threshold"]))
     scan["site_alert_cooldown_hours"] = max(1, int(scan["site_alert_cooldown_hours"]))
@@ -1371,7 +1702,7 @@ def get_config():
 
 def default_state():
     return {
-        "version": 28,
+        "version": 29,
         "initialized": False,
         "last_run": None,
         "items": {},
@@ -1425,6 +1756,7 @@ def load_state():
         record.setdefault("telegram_attempts", 0)
         record.setdefault("pdf_sent", False)
         record.setdefault("upload_date", None)
+        record.setdefault("explicit_title", "")
         record.setdefault("first_seen", utc_now())
         record.setdefault("last_seen", record["first_seen"])
         record.setdefault("etag", None)
@@ -1436,7 +1768,7 @@ def load_state():
             record["last_content_check_at"] = (
                 record.get("last_seen") or record.get("first_seen") or utc_now()
             )
-    state["version"] = 29
+    state["version"] = 30
     return state
 
 
@@ -1536,14 +1868,52 @@ def local_score(title, url, context, keywords):
 
 
 def pending_priority(record, keywords, now=None):
+    """Urgency + relevance + age; age remains a tie-breaker to avoid starvation."""
     now = now or datetime.now(timezone.utc)
     first_seen = _parse_utc_timestamp(record.get("first_seen"))
     age_days = max(0.0, (now - first_seen).total_seconds() / 86400) if first_seen else 0.0
+    title = " ".join((record.get("explicit_title") or "", record.get("title") or "", record.get("context") or "")).casefold()
+    if any(x in title for x in ("admit card", "exam date", "प्रवेश पत्र", "परीक्षा तिथि", "परीक्षा कार्यक्रम")):
+        urgency = 100
+    elif any(x in title for x in ("answer key", "result", "रिजल्ट", "परिणाम", "उत्तर कुंजी", "मेरिट सूची", "merit list")):
+        urgency = 50
+    else:
+        urgency = 0
     score = local_score(
         record.get("title", ""), record.get("url", ""), record.get("context", ""), keywords
     )
     age_bonus = min(age_days, 30.0)
-    return score + age_bonus, age_days
+    return urgency + score + age_bonus, age_days
+
+
+_PRECLASS_STRONG = (
+    "recruitment", "vacancy", "employment exchange", "admit card", "answer key",
+    "merit list", "selection list", "provisional list", "tender notice",
+    "भर्ती", "नियुक्ति", "निविदा", "मेरिट सूची", "प्रवेश पत्र", "उत्तर कुंजी",
+    "चयन सूची", "रिजल्ट", "परिणाम", "विज्ञापन संख्या",
+)
+_PRECLASS_NAV_ONLY = (
+    "photo gallery", "video gallery", "site map", "web policies", "screen reader", "feedback",
+)
+
+def _keyword_pre_classify(record):
+    """Conservative title-first shortcut: True=high-confidence notice, False=clear nav-only, None=Gemini.
+
+    Do not scan full PDF/page text for navigation words: footers can contain them.
+    Strong terms are checked on title fields only. Generic words such as 'notice',
+    'सूचना', 'आवेदन' intentionally do not trigger a shortcut.
+    """
+    title = " ".join((record.get("explicit_title") or "", record.get("title") or "")).casefold()
+    if any(sig in title for sig in _PRECLASS_STRONG):
+        return True
+    url = (record.get("url") or "").casefold()
+    title_is_nav = any(sig in title for sig in _PRECLASS_NAV_ONLY)
+    has_notice_signal = any(sig in title for sig in _PRECLASS_STRONG) or any(
+        sig in title for sig in ("notice", "notification", "सूचना", "आवेदन", "advertisement")
+    )
+    if title_is_nav and not has_notice_signal and not _is_notice_document_url(url):
+        return False
+    return None
 
 
 def item_id(site_id, url, title, context=""):
@@ -1601,11 +1971,22 @@ def find_fuzzy_match(site_items, title, url):
     if len(new_title) < 12:
         return None
 
+    # Do not collapse sequential notices just because their wording is similar.
+    # Ignore likely year tokens; compare remaining numeric identifiers/dates.
+    year_tokens = {"2022", "2023", "2024", "2025", "2026", "2027", "2028", "2029", "2030"}
+    new_nums = set(re.findall(r"\d+", new_title)) - year_tokens
+
     best = None
     best_score = 0
     for iid, existing_title, existing_url in site_items:
         existing_norm = _normalize_title(existing_title)
         if len(existing_norm) < 12:
+            continue
+        old_nums = set(re.findall(r"\d+", existing_norm)) - year_tokens
+        # If both titles have numeric identifiers and none match, treat as
+        # distinct candidates. This errs toward keeping notices rather than
+        # silently losing a potentially new numbered/date-specific notice.
+        if new_nums and old_nums and not (new_nums & old_nums):
             continue
         existing_segs = _url_path_segments(existing_url)
         overlap = bool(new_segs and existing_segs and (new_segs & existing_segs))
@@ -1617,6 +1998,32 @@ def find_fuzzy_match(site_items, title, url):
             best_score = score
             best = iid
     return best
+
+
+def _is_duplicate_by_pdf_hash(state, record, exclude_iid=None):
+    """Return the title of a previously sent same-site record with same fingerprint.
+
+    Only records already marked sent are blockers. `ready` is not enough: it
+    may not have been delivered yet. Fingerprints are compared only when both
+    fingerprint value and fingerprint kind match.
+    """
+    new_hash = record.get("pdf_hash")
+    new_kind = record.get("pdf_hash_kind")
+    new_site = record.get("site_id")
+    if not new_hash or not new_kind or not new_site:
+        return None
+    for other_iid, other in state.get("items", {}).items():
+        if other_iid == exclude_iid or not isinstance(other, dict):
+            continue
+        if other.get("status") != "sent":
+            continue
+        if other.get("site_id") != new_site:
+            continue
+        if other.get("pdf_hash_kind") != new_kind:
+            continue
+        if other.get("pdf_hash") == new_hash:
+            return other.get("title") or other_iid
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1683,7 +2090,6 @@ def extract_candidates(html_text, page_url, site, scan):
 
         score = local_score(title, href, context, keywords)
         href_lower = href.lower()
-        pdf_bonus = 0
         if is_pdf(href) or _looks_like_pdf_url(href):
             pdf_bonus = 2
         elif any(kw in href_lower for kw in (
@@ -1725,13 +2131,32 @@ def extract_candidates(html_text, page_url, site, scan):
             "score": score + pdf_bonus,
             "upload_date": upload_dt.isoformat() if upload_dt else None,
         })
+
     out.sort(key=lambda x: (-x["score"], x["title"].lower()))
     out = out[: scan["max_items_per_site"]]
-    # Only attach the page's explicit title when there is exactly one candidate.
-    if len(out) == 1:
-        explicit_title = _extract_explicit_title(soup)
-        if explicit_title:
-            out[0]["explicit_title"] = explicit_title
+
+    # Attach page-level structured "Title:" to every candidate whose URL
+    # points to a real notice document. This is the PRIMARY title source
+    # on NIC detail pages.
+    page_explicit_title = _extract_explicit_title(soup)
+    if page_explicit_title:
+        for row in out:
+            if _is_notice_document_url(row["url"]):
+                row["explicit_title"] = page_explicit_title
+
+    # Clean menu-dump titles on document URLs so downstream stages
+    # (dedup, stale-check, formatting) see something useful.
+    for row in out:
+        if _is_notice_document_url(row["url"]) and _looks_like_menu_dump(row.get("title", "")):
+            cleaned = _cleanup_menu_dump_title(
+                row["title"],
+                url=row["url"],
+                explicit=row.get("explicit_title", ""),
+            )
+            if cleaned and cleaned != row["title"]:
+                print(f"[TITLE-CLEANUP] {row['title'][:60]!r} → {cleaned[:60]!r}", file=sys.stderr)
+                row["title"] = cleaned
+
     return out
 
 
@@ -3548,15 +3973,12 @@ _FORMATTERS = {
 
 def format_message(site, item, classification=None):
     classification = classification or {}
-    # Priority: explicit_title (from website) > title (anchor) > context > URL slug
-    raw_title = clean_text(item.get("explicit_title") or item.get("title") or "", 300)
-    if not raw_title or _is_generic_title(raw_title) or _is_language_selector(raw_title):
-        raw_title = (
-            clean_text(item.get("context") or "", 200)
-            or _title_from_url(item.get("url", ""), min_len=5)
-            or "Notice"
-        )
-    raw_title = clean_text(raw_title, 300) or "Notice"
+
+    # Resolve the best title — prefers website 'Title:', then cleans
+    # menu-dump / garbage titles on document URLs so we never fall back
+    # to site-wide nav junk.
+    raw_title = _resolve_title(item)
+
     title_hi = _safe_str(classification.get("title_hi"), 200)
     title_is_hindi = _is_devanagari(raw_title)
     site_name = html.escape(site["name"])
@@ -3735,7 +4157,7 @@ def prune_state(state, retention_days, max_items=3000, max_pending_attempts=72, 
     for record in items.values():
         if not isinstance(record, dict):
             continue
-        for field, limit in (("title", 300), ("context", 700), ("summary", 500), ("last_error", 500), ("pdf_text", MAX_PDF_TEXT_CHARS)):
+        for field, limit in (("title", 300), ("context", 700), ("summary", 500), ("last_error", 500), ("pdf_text", MAX_PDF_TEXT_CHARS), ("explicit_title", 300)):
             value = record.get(field)
             if isinstance(value, str) and len(value) > limit:
                 record[field] = clean_text(value, limit)
@@ -3820,6 +4242,226 @@ def refresh_stats(state):
 
 
 # ---------------------------------------------------------------------------
+# Self-test harness (run with `python monitor.py --test`)
+# ---------------------------------------------------------------------------
+
+_SELF_TEST_STALE_CASES: List[Tuple[str, str, str, bool, str]] = [
+    # Real notices — MUST NOT be marked stale
+    ("संपर्क करें: नई भर्ती 2026", "", "", False,
+     "Hindi recruitment title that contains 'संपर्क' word"),
+    ("Facebook WhatsApp Integration Notice", "", "", False,
+     "Facebook-related integration notice (has 'notice' signal)"),
+    ("जिला प्रशासन द्वारा नई नियुक्ति सूचना", "", "", False,
+     "Hindi appointment notice"),
+    ("Tender Notice: Contact Office for Details", "", "", False,
+     "Tender with 'contact' nav word but also 'tender'/'notice' signals"),
+    ("19.09.2026: Very Short Term Tender Notice from Education Department, Giridih.",
+     "", "", False, "Dated tender notice from district site"),
+    ("भर्ती विज्ञापन संख्या 03/2026 - जिला प्रशासन गिरिडीह", "", "", False,
+     "Hindi vacancy with reference number"),
+
+    # Menu dumps on non-document URLs — MUST be marked stale
+    ("Home Whats New Facebook Latest News", "", "https://x.nic.in/about/", True,
+     "Classic English menu dump on non-document URL"),
+    ("Home Whats New Facebook X Whats New 08.10.2026", "", "https://x.nic.in/contact/", True,
+     "Long menu dump with repeated nav signals"),
+    ("Home Whats New Facebook X Whats New 08.10.2026: Important Apprenticeship "
+     "Notice From Employment Exchange, Giridih. Published on: 08/10/2026 "
+     "Prime Minister National Apprenticeship Mela – 12-10-2026 Sha", "", "", True,
+     "Real Giridih production case with empty URL (no document hint)"),
+    ("मुख्य पृष्ठ महत्वपूर्ण लिंक त्वरित लिंक", "", "", True,
+     "Hindi menu dump"),
+    ("About Us Contact Us Feedback Site Map", "", "https://x.nic.in/about/", True,
+     "Classic English about/contact nav dump"),
+    ("Home Facebook Twitter Instagram YouTube", "", "https://x.nic.in/", True,
+     "Social links nav dump"),
+
+    # Document URLs with menu-dump titles — must NOT be marked stale,
+    # so the title can be cleaned up before sending.
+    ("Home Whats New Facebook X Whats New 08.10.2026: Important Apprenticeship "
+     "Notice From Employment Exchange, Giridih.",
+     "", "https://giridih.nic.in/writereaddata/Apprenticeship.pdf", False,
+     "Giridih production case: document URL with menu-dump title must be kept"),
+    ("Home Whats New Facebook X Whats New: Latest Update",
+     "", "https://giridih.nic.in/downloadfile/notice_2026.pdf", False,
+     "Document URL with menu-dump title must be kept"),
+]
+
+
+def _run_stale_notice_self_tests():
+    failures = 0
+    total = len(_SELF_TEST_STALE_CASES)
+    print(f"[TEST] Running {total} stale-notice cases...", file=sys.stderr)
+    for title, context, url, expected, desc in _SELF_TEST_STALE_CASES:
+        try:
+            got = _is_stale_notice(title, context, url)
+        except Exception as exc:
+            print(f"[TEST-ERROR] {desc}: {type(exc).__name__}: {exc}", file=sys.stderr)
+            failures += 1
+            continue
+        if got == expected:
+            print(f"[TEST-PASS ] {desc}", file=sys.stderr)
+        else:
+            print(
+                f"[TEST-FAIL ] {desc}: got={got} expected={expected} "
+                f"title='{title[:70]}'",
+                file=sys.stderr,
+            )
+            failures += 1
+    print(
+        f"[TEST] Done: {total - failures}/{total} passed, {failures} failed.",
+        file=sys.stderr,
+    )
+    return failures
+
+
+def _run_dedup_self_tests():
+    failures = 0
+    total = 0
+
+    cases = [
+        ([('old', 'Recruitment Notice 01/2026 For Clerk Post', 'https://x.nic.in/writereaddata/notice01.pdf')],
+         'Recruitment Notice 02/2026 For Clerk Post', 'https://x.nic.in/writereaddata/notice02.pdf', None,
+         'sequential numbered notices remain distinct'),
+        ([('old', 'Recruitment Notice 01/2026 For Clerk Post', 'https://x.nic.in/writereaddata/notice01.pdf')],
+         'Recruitment Notice 01/2026 For Clerk Post', 'https://x.nic.in/writereaddata/notice01-copy.pdf', 'old',
+         'same numbered notice remains deduplicable'),
+    ]
+    for site_items, title, url, expected, label in cases:
+        total += 1
+        got = find_fuzzy_match(site_items, title, url)
+        if got == expected:
+            print(f"[TEST-PASS ] {label}", file=sys.stderr)
+        else:
+            print(f"[TEST-FAIL ] {label}: got={got!r}, expected={expected!r}", file=sys.stderr)
+            failures += 1
+
+    state = {"items": {
+        "sent1": {"site_id": "district-a", "status": "sent", "title": "Notice A", "pdf_hash": "visual-v1:abc", "pdf_hash_kind": "visual-v1"},
+        "ready1": {"site_id": "district-a", "status": "ready", "title": "Notice B", "pdf_hash": "visual-v1:ready", "pdf_hash_kind": "visual-v1"},
+        "sent_other_site": {"site_id": "district-b", "status": "sent", "title": "Notice C", "pdf_hash": "visual-v1:abc", "pdf_hash_kind": "visual-v1"},
+    }}
+    hash_cases = [
+        ({"site_id": "district-a", "pdf_hash": "visual-v1:abc", "pdf_hash_kind": "visual-v1"}, "Notice A", "same-site sent PDF fingerprint detected"),
+        ({"site_id": "district-a", "pdf_hash": "visual-v1:ready", "pdf_hash_kind": "visual-v1"}, None, "ready-only fingerprint does not block sending"),
+        ({"site_id": "district-c", "pdf_hash": "visual-v1:abc", "pdf_hash_kind": "visual-v1"}, None, "cross-district fingerprint does not block sending"),
+        ({"site_id": "district-a", "pdf_hash": "visual-v1:different", "pdf_hash_kind": "visual-v1"}, None, "different fingerprint remains eligible"),
+    ]
+    for record, expected, label in hash_cases:
+        total += 1
+        got = _is_duplicate_by_pdf_hash(state, record, exclude_iid="new")
+        if got == expected:
+            print(f"[TEST-PASS ] {label}", file=sys.stderr)
+        else:
+            print(f"[TEST-FAIL ] {label}: got={got!r}, expected={expected!r}", file=sys.stderr)
+            failures += 1
+    print(f"[TEST] Dedup: {total - failures}/{total} passed, {failures} failed.", file=sys.stderr)
+    return failures
+
+
+def _run_title_cleanup_self_tests():
+    failures = 0
+    total = 0
+
+    # 1. Filename extraction
+    total += 1
+    name = _filename_to_title("https://giridih.nic.in/writereaddata/Apprenticeship_Mela_12102026.pdf")
+    if "Apprenticeship" in name and "Mela" in name:
+        print(f"[TEST-PASS ] filename_to_title → {name!r}", file=sys.stderr)
+    else:
+        print(f"[TEST-FAIL ] filename_to_title: got {name!r}", file=sys.stderr)
+        failures += 1
+
+    # 2. Nav-prefix strip on the Giridih production string
+    total += 1
+    garbage = ("Home Whats New Facebook X Whats New 08.10.2026: "
+               "Important Apprenticeship Notice From Employment Exchange, Giridih. "
+               "Published on: 08/10/2026 Prime Minister National Apprenticeship Mela – 12-10-2026 Sha")
+    cleaned = _strip_nav_prefix(garbage)
+    if ("Apprenticeship" in cleaned
+            and not cleaned.lower().startswith("home")
+            and "Published on" not in cleaned):
+        print(f"[TEST-PASS ] strip_nav_prefix → {cleaned[:80]!r}", file=sys.stderr)
+    else:
+        print(f"[TEST-FAIL ] strip_nav_prefix: got {cleaned!r}", file=sys.stderr)
+        failures += 1
+
+    # 3. Menu-dump detection
+    total += 1
+    if _looks_like_menu_dump("Home Whats New Facebook X Whats New 08.10.2026"):
+        print("[TEST-PASS ] looks_like_menu_dump detected nav run", file=sys.stderr)
+    else:
+        print("[TEST-FAIL ] looks_like_menu_dump missed nav run", file=sys.stderr)
+        failures += 1
+
+    # 4. Real notice title must not be flagged as menu-dump
+    total += 1
+    if not _looks_like_menu_dump("Important Recruitment Notice From Employment Exchange, Giridih"):
+        print("[TEST-PASS ] clean title not flagged as menu-dump", file=sys.stderr)
+    else:
+        print("[TEST-FAIL ] clean title wrongly flagged as menu-dump", file=sys.stderr)
+        failures += 1
+
+    # 5. _resolve_title prefers explicit_title
+    total += 1
+    item = {
+        "explicit_title": "10.09.2026: Important Recruitment Notice From Employment Exchange, Giridih.",
+        "title": "Home Whats New Facebook X Whats New garbage",
+        "context": "site-wide nav",
+        "url": "https://giridih.nic.in/writereaddata/x.pdf",
+    }
+    resolved = _resolve_title(item)
+    if resolved.startswith("10.09.2026"):
+        print(f"[TEST-PASS ] resolve_title → {resolved[:60]!r}", file=sys.stderr)
+    else:
+        print(f"[TEST-FAIL ] resolve_title: got {resolved!r}", file=sys.stderr)
+        failures += 1
+
+    # 6. _resolve_title cleans menu-dump when no explicit_title exists
+    total += 1
+    item = {
+        "title": garbage,
+        "context": "",
+        "url": "https://giridih.nic.in/writereaddata/Apprenticeship_Mela_12102026.pdf",
+    }
+    resolved = _resolve_title(item)
+    if "Apprenticeship" in resolved and "Home" not in resolved[:10]:
+        print(f"[TEST-PASS ] resolve_title cleanup → {resolved[:60]!r}", file=sys.stderr)
+    else:
+        print(f"[TEST-FAIL ] resolve_title cleanup: got {resolved!r}", file=sys.stderr)
+        failures += 1
+
+    # 7. explicit_title extraction from a NIC-style table
+    total += 1
+    html_snippet = """
+    <html><body><table>
+      <tr><th>Title:</th><td>10.09.2026: Important Recruitment Notice From Employment Exchange, Giridih.</td></tr>
+      <tr><th>Description:</th><td>Important Recruitment Notice From Employment Exchange, Giridih.</td></tr>
+    </table></body></html>
+    """
+    soup = BeautifulSoup(html_snippet, "html.parser")
+    extracted = _extract_explicit_title(soup)
+    if extracted.startswith("10.09.2026") and "Recruitment Notice" in extracted:
+        print(f"[TEST-PASS ] extract_explicit_title → {extracted[:60]!r}", file=sys.stderr)
+    else:
+        print(f"[TEST-FAIL ] extract_explicit_title: got {extracted!r}", file=sys.stderr)
+        failures += 1
+
+    # 8. is_notice_document_url positive/negative
+    total += 1
+    if (_is_notice_document_url("https://x.nic.in/writereaddata/a.pdf")
+            and _is_notice_document_url("https://x.nic.in/downloadfile?id=5")
+            and not _is_notice_document_url("https://x.nic.in/about-us/")):
+        print("[TEST-PASS ] is_notice_document_url classifies correctly", file=sys.stderr)
+    else:
+        print("[TEST-FAIL ] is_notice_document_url misclassified a URL", file=sys.stderr)
+        failures += 1
+
+    print(f"[TEST] Title-cleanup: {total - failures}/{total} passed, {failures} failed.", file=sys.stderr)
+    return failures
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -3836,7 +4478,6 @@ def _should_fetch_pdf(record):
         "/notice_category", "/notice-category",
         "/document-category", "/document_category",
         "/archive", "/search",
-        # Additional navigation-page patterns observed in production logs
         "/contact-us", "/contact_us", "/contactus",
         "/about-district", "/about_district",
         "/photo-gallery", "/photo_gallery",
@@ -3906,17 +4547,8 @@ def _fetch_pdfs_for_batch(batch, scan):
                 record["pdf_extracted"] = True
                 record["ocr_used"] = bool(ocr_used)
 
-                # -----------------------------------------------------------------
-                # PDF TITLE UPGRADE IS DISABLED.
-                #
-                # In production this heuristic repeatedly picked the wrong line
-                # (PDF body text, table rows, or OCR garbage) and overrode the
-                # website-provided title. Website title (explicit_title) and the
-                # anchor/context title chain are far more reliable.
-                #
-                # We still extract a distinct summary hint from the PDF, but we
-                # never override the title.
-                # -----------------------------------------------------------------
+                # PDF title upgrade is intentionally disabled — website
+                # title (explicit_title) or cleaned anchor title wins.
                 try:
                     _bt, pdf_summary = _extract_pdf_title_and_summary(
                         raw_pdf_text or text,
@@ -3927,8 +4559,11 @@ def _fetch_pdfs_for_batch(batch, scan):
                 except Exception as exc:
                     print(f"[WARN] PDF summary extraction failed: {exc}", file=sys.stderr)
 
+                effective_title = (
+                    record.get("explicit_title") or record.get("title", "")
+                )
                 if _is_stale_notice(
-                    record.get("title", ""), record.get("context", ""), record.get("url", ""),
+                    effective_title, record.get("context", ""), record.get("url", ""),
                     upload_date=_parse_upload_date(record.get("upload_date")), pdf_text=text,
                 ):
                     record["status"] = "baseline"
@@ -3956,8 +4591,9 @@ def suppress_stale_pending_and_ready(state):
     for record in state.get("items", {}).values():
         if not isinstance(record, dict) or record.get("status") not in {"pending", "ready"}:
             continue
+        effective_title = record.get("explicit_title") or record.get("title", "")
         if _is_stale_notice(
-            record.get("title", ""), record.get("context", ""), record.get("url", ""),
+            effective_title, record.get("context", ""), record.get("url", ""),
             upload_date=_parse_upload_date(record.get("upload_date")),
             pdf_text=record.get("pdf_text", ""),
         ):
@@ -4002,7 +4638,7 @@ def main():
 
     import time as _time
     _START_TIME = _time.monotonic()
-    _MAX_RUN_SECONDS = 35 * 60
+    _MAX_RUN_SECONDS = 55 * 60  # monitor.yml timeout is 60 minutes; reserve 5 minutes for state persistence
 
     def _time_exceeded():
         return (_time.monotonic() - _START_TIME) > _MAX_RUN_SECONDS
@@ -4124,11 +4760,16 @@ def main():
             iid = item_id(sid, candidate["url"], candidate["title"], candidate.get("context", ""))
             record = state["items"].get(iid)
             upload_dt = _parse_upload_date(candidate.get("upload_date"))
+            effective_cand_title = candidate.get("explicit_title") or candidate.get("title", "")
 
             if _is_stale_notice(
-                candidate.get("title", ""), candidate.get("context", ""),
+                effective_cand_title, candidate.get("context", ""),
                 candidate.get("url", ""), upload_date=upload_dt,
             ):
+                reason = _classify_stale_reason(
+                    effective_cand_title, candidate.get("context", ""),
+                    candidate.get("url", ""), upload_date=upload_dt,
+                ) or "STALE"
                 matched_iid = iid if record is not None else find_url_match(site_items_list, candidate["url"])
                 if not matched_iid and record is None:
                     matched_iid = find_fuzzy_match(site_items_list, candidate.get("title", ""), candidate.get("url", ""))
@@ -4139,11 +4780,12 @@ def main():
                         stale_record["status"] = "baseline"
                         stale_record["classification"] = None
                         stale_record["summary"] = ""
-                        stale_record["last_error"] = f"Stale notice (limit={STALE_NOTICE_DAYS}d or old year)"
+                        stale_record["last_error"] = f"Stale notice ({reason})"
                 else:
                     state["items"][iid] = {
                         "site_id": sid, "site_name": site["name"],
                         "url": candidate["url"], "title": candidate.get("title", ""),
+                        "explicit_title": candidate.get("explicit_title", ""),
                         "context": candidate.get("context", "")[:700],
                         "is_pdf": bool(candidate.get("is_pdf")),
                         "first_seen": utc_now(), "last_seen": utc_now(),
@@ -4152,12 +4794,12 @@ def main():
                         "pdf_text": "", "pdf_attempts": 0, "ocr_used": False,
                         "pdf_method": "", "telegram_attempts": 0, "pdf_sent": False,
                         "upload_date": candidate.get("upload_date"),
-                        "last_error": f"Stale notice (limit={STALE_NOTICE_DAYS}d or old year)",
+                        "last_error": f"Stale notice ({reason})",
                         "etag": None, "last_modified": None, "pdf_hash": None,
                         "pdf_hash_kind": None, "last_content_check_at": None,
                     }
                     site_items_list.append((iid, candidate.get("title", ""), candidate.get("url", "")))
-                print(f"[STALE-SKIP] {candidate.get('title', '')[:80]}", file=sys.stderr)
+                print(f"[{reason}] {effective_cand_title[:80]}", file=sys.stderr)
                 continue
 
             url_lower = candidate["url"].lower()
@@ -4216,12 +4858,17 @@ def main():
 
                 upload_dt = _parse_upload_date(candidate.get("upload_date"))
                 if _is_stale_notice(
-                    candidate["title"], candidate.get("context", ""),
+                    effective_cand_title, candidate.get("context", ""),
                     candidate["url"], upload_date=upload_dt,
                 ):
+                    reason = _classify_stale_reason(
+                        effective_cand_title, candidate.get("context", ""),
+                        candidate["url"], upload_date=upload_dt,
+                    ) or "STALE"
                     state["items"][iid] = {
                         "site_id": sid, "site_name": site["name"],
                         "url": candidate["url"], "title": candidate["title"],
+                        "explicit_title": candidate.get("explicit_title", ""),
                         "context": candidate.get("context", "")[:700],
                         "is_pdf": is_pdf_or_notice,
                         "first_seen": utc_now(), "last_seen": utc_now(),
@@ -4230,7 +4877,7 @@ def main():
                         "pdf_text": "", "pdf_attempts": 0, "ocr_used": False,
                         "pdf_method": "", "telegram_attempts": 0, "pdf_sent": False,
                         "upload_date": candidate.get("upload_date"),
-                        "last_error": f"Stale (limit={STALE_NOTICE_DAYS}d)",
+                        "last_error": f"Stale ({reason})",
                         "etag": None, "last_modified": None, "pdf_hash": None, "pdf_hash_kind": None, "last_content_check_at": None,
                     }
                     site_items_list.append((iid, candidate["title"], candidate["url"]))
@@ -4350,7 +4997,7 @@ def main():
     )
     max_items_this_run = min(
         scan["gemini_batch_size"] * scan["gemini_max_calls_per_run"],
-        40,
+        45,
     )
     pending = pending[:max_items_this_run]
 
@@ -4366,12 +5013,36 @@ def main():
         except Exception as exc:
             print(f"[WARN] PDF batch fetch failed: {exc}", file=sys.stderr)
         try:
-            result = gemini_classify_with_fallback(
-                [record for _, record in batch], gemini_key, scan["request_timeout_seconds"],
-            )
-            for index, (_, record) in enumerate(batch):
+            # Pre-classify only high-confidence titles. Ambiguous records alone use Gemini.
+            gemini_batch = []
+            for iid, record in batch:
                 if record.get("status") == "baseline" and str(record.get("last_error", "")).startswith("PDF content stale"):
                     continue
+                pre = _keyword_pre_classify(record)
+                if pre is True:
+                    record["classification"] = {
+                        "important": True, "category": "notice", "summary": "",
+                        "title_hi": None, "pre_classified": True,
+                    }
+                    record["summary"] = ""
+                    record["last_error"] = None
+                    record["status"] = "ready"
+                    record["preclassified_at"] = utc_now()
+                    print(f"[PRE-CLASSIFIED] {record.get('title', '')[:70]}")
+                elif pre is False:
+                    record["classification"] = {"important": False, "category": "other", "pre_classified": True}
+                    record["last_error"] = None
+                    record["status"] = "ignored"
+                    record["preclassified_at"] = utc_now()
+                    print(f"[PRE-IGNORED] Clear navigation title: {record.get('title', '')[:70]}")
+                else:
+                    gemini_batch.append((iid, record))
+            result = {}
+            if gemini_batch:
+                result = gemini_classify_with_fallback(
+                    [record for _, record in gemini_batch], gemini_key, scan["request_timeout_seconds"],
+                )
+            for index, (_, record) in enumerate(gemini_batch):
                 record["attempts"] = int(record.get("attempts", 0)) + 1
                 classification = result.get(str(index))
                 if classification is None:
@@ -4381,6 +5052,30 @@ def main():
                     continue
                 if classification.get("ambiguous") is True or classification.get("needs_review") is True:
                     add_review_item(state, record, "Gemini marked notice ambiguous", classification)
+                # Conservative false-negative guard: only override Gemini when
+                # the site supplied an explicit title with a high-specificity
+                # public-notice signal. Generic words like "सूचना"/"आवेदन" are
+                # deliberately excluded to avoid turning navigation into alerts.
+                strong_signals = (
+                    "recruitment", "vacancy", "employment exchange", "admit card",
+                    "answer key", "merit list", "provisional list", "appointment letter",
+                    "भर्ती", "नियुक्ति", "प्रवेश पत्र", "उत्तर कुंजी", "मेरिट सूची",
+                    "निविदा", "चयन सूची", "रिजल्ट", "परिणाम", "विज्ञापन संख्या",
+                )
+                combined_title = " ".join((
+                    record.get("explicit_title") or "",
+                    record.get("title") or "",
+                )).casefold()
+                if (not classification.get("important")
+                        and record.get("explicit_title")
+                        and any(signal in combined_title for signal in strong_signals)):
+                    print(
+                        f"[OVERRIDE] Explicit website title has a high-specificity notice signal: "
+                        f"{(record.get('explicit_title') or '')[:70]}",
+                        file=sys.stderr,
+                    )
+                    classification["important"] = True
+                    classification["review_reason"] = "explicit_title_strong_signal_override"
                 record["last_error"] = None
                 record["classification"] = classification
                 record["summary"] = classification.get("summary", "")
@@ -4388,6 +5083,8 @@ def main():
         except Exception as exc:
             error = clean_text(str(exc), 500)
             for _, record in batch:
+                if record.get("status") in {"ready", "ignored"} and (record.get("classification") or {}).get("pre_classified"):
+                    continue
                 record["attempts"] = int(record.get("attempts", 0)) + 1
                 record["status"] = "pending"
                 record["last_error"] = error
@@ -4414,6 +5111,22 @@ def main():
         if site is None:
             record["status"] = "permanent_error"
             record["last_error"] = "Configured site no longer exists"
+            continue
+
+        # Second-line cross-record duplicate protection. This runs at send time,
+        # after an earlier matching item may have been successfully delivered.
+        duplicate_title = _is_duplicate_by_pdf_hash(state, record, exclude_iid=iid)
+        if duplicate_title:
+            print(
+                f"[DEDUP-HASH] {record.get('title', '')[:60]} matches sent notice: "
+                f"{duplicate_title[:60]}",
+                file=sys.stderr,
+            )
+            record["status"] = "ignored"
+            record["last_error"] = f"Duplicate PDF fingerprint of sent notice: {duplicate_title[:120]}"
+            state.setdefault("metrics", {})["duplicate_rejects"] = int(
+                state.setdefault("metrics", {}).get("duplicate_rejects", 0)
+            ) + 1
             continue
 
         full_message = format_message(site, record, record.get("classification"))
@@ -4515,4 +5228,9 @@ def main():
 
 
 if __name__ == "__main__":
+    if "--test" in sys.argv:
+        _fails = (_run_stale_notice_self_tests()
+                  + _run_title_cleanup_self_tests()
+                  + _run_dedup_self_tests())
+        raise SystemExit(1 if _fails else 0)
     raise SystemExit(main())
