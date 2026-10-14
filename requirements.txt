@@ -6,3 +6,5 @@ rapidfuzz>=3.9,<4
 Pillow>=10.0,<12
 PyMuPDF>=1.24,<2
 rapidocr-onnxruntime>=1.4,<2
+onnxruntime>=1.17
+pytesseract>=0.3.10,<1
